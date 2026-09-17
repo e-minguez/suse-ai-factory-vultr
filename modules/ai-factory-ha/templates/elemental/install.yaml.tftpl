@@ -1,0 +1,28 @@
+schema: v0
+
+bootloader: grub
+
+# ignition.platform.id=vultr selects where the *user* config comes from (the
+# metadata service). It does NOT replace elemental's base.d drop-ins, which the
+# Ignition engine reads on every platform -- see butane.yaml.tftpl's header for
+# how the two layer.
+#
+# Nodes that behave as if base.d were empty (Ignition logging `no config dir at
+# "/usr/lib/ignition/base.d"`) are hitting a version skew, not this setting:
+# the CPIO carrying base.d is attached via bootloader.initrdExtensions, and a
+# 3.0.x elemental3ctl silently ignores that key. See var.core_platform_override.
+#
+# console=ttyS1,115200n8, not elemental's stock ttyS0: a node built with
+# ttyS0 respawns serial-getty@ttyS0.service every ~10s for its whole uptime,
+# because ttyS0 is not a real TTY on Vultr's hypervisor. ttyS1 is what Vultr's own stock images use -- the hypervisor
+# chooses the wiring, not the guest.
+kernelCmdLine: "console=ttyS1,115200n8 console=tty0 quiet ignition.platform.id=vultr"
+%{ if fips ~}
+
+# Every node in the cluster must be FIPS-ready once this is set -- var.fips
+# defaults to false because that is not a call to make silently.
+cryptoPolicy: fips
+%{ endif ~}
+
+raw:
+  diskSize: ${disk_size}

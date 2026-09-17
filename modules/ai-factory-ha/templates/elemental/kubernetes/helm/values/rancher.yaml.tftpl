@@ -1,0 +1,5 @@
+# The release manifest bakes in replicas/postDelete/global.* for the rancher
+# chart already -- this file only supplies what it doesn't: a hostname for
+# Rancher's ingress, and the initial admin bootstrap password.
+hostname: ${hostname}
+bootstrapPassword: "${bootstrap_password}"

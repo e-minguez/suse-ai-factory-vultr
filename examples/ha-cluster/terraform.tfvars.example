@@ -1,0 +1,255 @@
+region = "ams"
+
+# elemental_image defaults to registry.suse.com/beta/uc/elemental:3.1.0-6.5,
+# confirmed (by pulling it and grepping the compiled binary) to carry
+# apiVIPMode support -- see the README. Still a beta, not a final release;
+# fall back to this previously-verified alternative if it's ever superseded:
+# elemental_image = "registry.opensuse.org/devel/unifiedcore/tumbleweed/containers/elemental:latest"
+
+# --------------------------------------------------------------------------
+# The vultr provider reads VULTR_API_KEY from the environment — do not set
+# it here. This variable is a SEPARATE key, handed to the jumphost so its
+# image-factory script can call the Vultr API (create-from-url, poll the
+# snapshot). It ends up in the jumphost's cloud-init user_data, which is
+# retrievable via `GET /v2/instances/{id}/user-data` for as long as the
+# jumphost exists. Use a key scoped with Vultr's IP allowlist restricted to
+# the jumphost's address, and revoke it once the snapshot has been built —
+# it is not needed again after that.
+# --------------------------------------------------------------------------
+vultr_api_key = "REPLACE_WITH_A_SCOPED_API_KEY"
+
+# CIDRs allowed to SSH into the jumphost. Your admin IP(s)/VPN range, not 0.0.0.0/0.
+admin_cidrs = ["REPLACE_WITH_YOUR_IP/32"]
+
+# Generate both with: openssl passwd -6
+# root's is the console login and the password `su -` asks for; the node user's
+# is what gets you a shell. They must differ -- Terraform rejects the plan if
+# they do not, since sharing one credential is the thing the split exists to
+# avoid.
+root_password_hash      = "REPLACE_WITH_OUTPUT_OF_openssl_passwd_-6"
+node_user_password_hash = "REPLACE_WITH_A_DIFFERENT_OUTPUT_OF_openssl_passwd_-6"
+
+# At least one public key. Injected onto node_username on every elemental node,
+# onto the jumphost, and onto root too only if permit_root_ssh is true.
+ssh_authorized_keys = ["REPLACE_WITH_YOUR_ssh-ed25519_OR_ssh-rsa_PUBLIC_KEY"]
+
+# Unprivileged login on the elemental nodes. Escalate with `su -` (sudo is not
+# installed in the image). Optional -- this is the default.
+# node_username = "suse"
+
+# Allow `ssh root@<node>` and give root the SSH keys. Off by default. Worth
+# turning on for a throwaway cluster: every troubleshooting recipe in the
+# README is written as root, and `ssh suse@<node>` + `su -` is one more step
+# each time. Flipping it rebuilds the image and replaces every node.
+# permit_root_ssh = true
+
+# --------------------------------------------------------------------------
+# SUSE AI Factory helm charts (release.yaml / aif-operator.yaml) need two
+# separate sets of registry credentials. Neither has a default.
+# --------------------------------------------------------------------------
+
+# SUSE Application Collection (local-path-provisioner chart pull + image pull
+# secret, and aif-operator.yaml's credentials.applicationCollection).
+appco_username = "REPLACE_WITH_YOUR_APPLICATION_COLLECTION_USERNAME"
+appco_password = "REPLACE_WITH_YOUR_APPLICATION_COLLECTION_PASSWORD"
+
+# SUSE registry: the "username" here is always your registration code itself.
+suse_registration_code = "REPLACE_WITH_YOUR_SUSE_REGISTRATION_CODE"
+suse_registry_password = "REPLACE_WITH_YOUR_SUSE_REGISTRY_PASSWORD"
+
+# --------------------------------------------------------------------------
+# GPU WORKERS -- both maps default to {}, i.e. a control-plane-only cluster.
+# Set at least one pool, and price it first: nothing here is cheap.
+#
+# Two families, mixable in one cluster:
+#
+#   gpu_bare_metal_pools -> vultr_bare_metal_server, vbm-* plans, mandatory
+#     PUBLIC IP WITH NO FIREWALL (Vultr has no bare metal firewall at all).
+#       vbm-48c-1024gb-4-a100-gpu      4x A100   ~$7,000/mo
+#       vbm-64c-2048gb-8-l40-gpu       8x L40S   ~$12,000/mo
+#       vbm-112c-2048gb-8-a100-gpu     8x A100   ~$15,053/mo
+#       vbm-256c-3072gb-8-mi355x-gpu   8x MI355X ~$15,126/mo
+#       vbm-112c-2048gb-8-h100-gpu     8x H100   ~$16,074/mo
+#       vbm-256c-3072gb-8-mi325x-gpu   8x MI325X ~$24,810/mo
+#       vbm-256c-3072gb-8-b200-gpu     8x B200   ~$45,696/mo
+#     vbm-72c-480gb-gh200-gpu (~$2,009/mo, 1x GH200) is NOT usable despite
+#     being far cheaper: it's ARM (NVIDIA Grace) and elemental3 only
+#     customizes x86_64 images.
+#
+#   gpu_cloud_pools -> vultr_instance, vcg-* plans. vpc_only (no public NIC at
+#     all) DEFAULTS TO TRUE here -- egress via the NAT gateway, admin via the
+#     jumphost, same shape as a control-plane node. Set vpc_only = false for a
+#     firewalled public NIC when you want direct SSH, or when funnelling
+#     multi-GB driver images through one shared NAT gateway is the wrong call.
+#     Bare metal gets no such choice; it always has a public NIC.
+#     plan_type is the plan's OWN type field
+#     and is NOT the id prefix:
+#       vcg-a100-12c-120g-80vram       1x A100-80   ~$1,750/mo   type vdm
+#       vcg-a100-96c-960g-640vram      8x A100-80   ~$14,000/mo  type vdm
+#       vcg-h100-216c-1914gb-640vram   8x H100      type vdm, on-demand OFF
+#       vcg-b200-248c-2826g-1536vram   8x B200      type vdm, on-demand OFF
+#       vcg-mi325x-*, vcg-mi355x-*                  type vdm, on-demand OFF
+#       vcg-a16-*, vcg-l40s-*, vcg-a40-<24c         type vcg -- FRACTIONAL
+#     plan_type is inferred from the plan id and only needs setting for that
+#     last, fractional row: every other prefix already IS its type, and vcg-*
+#     resolves to vdm.
+#     The fractional (type vcg) SKUs expect the host's vGPU guest driver stack
+#     and are not expected to work on an elemental3 image. Plans with
+#     deploy_ondemand = false can only be launched preemptible, which this
+#     module does not do.
+#
+# Pool names become hostnames: "<cluster_name>-<pool>-NN". They must be unique
+# across BOTH maps, and "cp" is reserved. A pool named "gpu" reproduces the
+# hostnames this example used before pools existed.
+#
+# Check stock first -- most regions carry no GPU plans at all:
+#   curl -s -H "Authorization: Bearer $VULTR_API_KEY" \
+#     "https://api.vultr.com/v2/regions/$REGION/availability?type=vbm"
+#   ... and again with type=vdm, type=vcg.
+#
+# gpu_bare_metal_pools = {
+#   gpu = { plan = "vbm-256c-3072gb-8-mi325x-gpu", count = 2 }
+# }
+# gpu_cloud_pools = {
+#   a100 = { plan = "vcg-a100-12c-120g-80vram", count = 2 }
+#   big  = { plan = "vcg-a100-96c-960g-640vram", count = 1, vpc_only = false }
+# }
+#
+# Neither map actually requires a GPU plan, and for testing neither should
+# have one: ams carries zero vdm/vcg stock and the cheapest vbm GPU plan is
+# $7,000/month. A non-GPU stand-in exercises everything about the worker path
+# that matters -- join, firewall group, dual-NIC metadata, scale-out -- and
+# differs only in never getting a driver.
+#
+# gpu_bare_metal_pools = {
+#   gpu = { plan = "vbm-6c-32gb-amd", count = 1 }
+# }
+# gpu_cloud_pools = {
+#   cgpu = { plan = "voc-c-4c-8gb-150s-amd", count = 1 }
+# }
+# --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# core_platform_override -- REQUIRED for a cluster that actually gets RKE2.
+#
+# Without it the build follows the AIF manifest's corePlatform.image to an OS
+# image whose elemental3ctl is on the 3.0.x line. Those builds silently drop
+# bootloader.initrdExtensions, which is the sole delivery mechanism for the
+# Kubernetes firstboot chain -- the node installs, boots, lets you log in, has
+# an empty `systemctl --failed`, and has no /etc/rancher, no rke2 units and no
+# error in any log. Support exists only on the elemental3ctl 3.1.0 line. The
+# newest GA base-os-kernel-default (16.0-3.45) is 3.0.3.20260908 -- built a day
+# AFTER the feature merged and still without it, because GA tracks the 3.0.x
+# maintenance line. Waiting for a newer GA build will not fix this.
+#
+# Verified by running, on the jumphost:
+#   podman run --rm --entrypoint sh \
+#     registry.suse.com/beta/uc/base-os-kernel-default:16.1-72.40 -c \
+#     'elemental3ctl version; grep -ac "Concatenating extensions" /usr/bin/elemental3ctl'
+# A non-zero grep count is the image carrying the fix.
+#
+# Only os_image_iso is actually consumed -- internal/customize/customize.go:76
+# extracts the ISO variant and never reads .Base -- but the manifest schema
+# marks both required, so both are set. Their build numbers differ because the
+# two repos are tagged independently; they are not expected to match.
+#
+# This pairs a beta OS image with AIF 2.2's chart set, which is off the
+# combination SUSE tests. That is deliberate and currently unavoidable.
+# core_platform_override = {
+#   os_image_base      = "registry.suse.com/beta/uc/base-os-kernel-default:16.1-72.40"
+#   os_image_iso       = "registry.suse.com/beta/uc/base-os-kernel-default-iso:16.1-72.67"
+#   kubernetes_version = "v1.35.6+rke2r1"
+#   kubernetes_image   = "registry.suse.com/elemental/rke2/rke2-tar:1.35.6_rke2r1-9.1"
+# }
+# --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# sysext_image_overrides -- the sibling of core_platform_override, for the
+# same reason: beta bits. ALREADY ON BY DEFAULT; listed here to be overridden,
+# not to be enabled.
+#
+# The AIF manifest pins each systemd system extension's OCI image, and
+# release.yaml can only NAME an extension -- there is no per-extension image
+# field in that schema -- so an override has to rewrite the manifest itself.
+# The build script does that in the same step that flattens the core platform,
+# and runs for a sysext override alone with no core override set.
+#
+# AIF 2.2 pins registry.suse.com/elemental/longhorn:4.111-4.79, the GA
+# extension, which does not match the beta 16.1 OS image above -- so the
+# default already points suse-storage at the matching beta build:
+#
+#   sysext_image_overrides = {
+#     suse-storage = "registry.suse.com/beta/uc/longhorn:5.279-4.13"
+#   }
+#
+# Inert unless "suse-storage" is in components: the module drops overrides for
+# extensions no enabled component pulls in, so on the default chart set this
+# rewrites nothing and does not change the build id.
+#
+# Keys are extension names as the MANIFEST spells them. Once an override does
+# apply, naming an extension the manifest does not declare fails the build
+# immediately with the list of names it does declare -- so against a manifest
+# with no suse-storage extension at all, set this empty rather than leaving the
+# default:
+# sysext_image_overrides = {}
+# --------------------------------------------------------------------------
+
+# Everything else below has a sensible default in the module; uncomment to override.
+
+# AI Factory version. Picks the manifest from SUSE/aif's aif-operator-<version>
+# TAG, so it must be a full X.Y.Z -- there is no "2.2" tag. Pre-releases are
+# tags too ("2.3.0-dev.2", "2.2.0-rc.1"). 2.1.0 is the oldest tag that has a
+# manifest at all. `git ls-remote --tags https://github.com/SUSE/aif` lists them.
+#
+# It selects the CHARTS only. The OS image (elemental_image), the core platform
+# (core_platform_override) and the longhorn extension (sysext_image_overrides)
+# are pinned separately and are not moved by this.
+# aif_version = "2.2.0"
+#
+# Overrides aif_version completely. Only needed for a manifest that is not on a
+# tag -- a branch ref, a fork, a mirror. Note a branch moves under you: the
+# manifest's content is hashed into the build id, so it does force a rebuild,
+# it just won't appear in a plan diff.
+# aif_release_manifest_url = "https://raw.githubusercontent.com/SUSE/aif/refs/heads/main/uc-release-manifest/release_manifest.yaml"
+# rancher_hostname           = null  # defaults to "rancher-<ingress_lb_ipv4>.sslip.io"
+# rancher_bootstrap_password = null  # defaults to a generated password
+# api_host                   = null  # defaults to "rke2-<api_vip>.sslip.io", added to the
+                                     # API server certificate's SANs
+
+# Ingress. "traefik" (the default) also creates a SECOND Vultr load balancer
+# for 80/443 with proxy protocol on, so Traefik sees real client addresses,
+# and pins the Traefik DaemonSet to the control-plane nodes -- otherwise it
+# would bind 80/443 on the GPU bare metal nodes' unfirewalled public IPs too.
+# "none" skips that load balancer; "ingress-nginx" is end-of-life upstream.
+# ingress_controller = "traefik"
+# ingress_cidrs      = ["0.0.0.0/0"]  # who may reach the ingress LB on 80/443
+
+# Optional: NVIDIA NGC API key (username is always "$oauthtoken", hardcoded
+# in the module). When left at its null default, aif-operator.yaml's
+# nvidia: credentials block is omitted entirely.
+# nvidia_api_key = "REPLACE_WITH_YOUR_NVIDIA_NGC_API_KEY"
+
+# --------------------------------------------------------------------------
+# components -- which SUSE AI Factory Helm charts release.yaml enables.
+# Rendered in a fixed canonical order regardless of the order typed here.
+# Changing this rebuilds the image and replaces every node (release.yaml is
+# baked in) -- this is not the rebuild-free scale-out path.
+# --------------------------------------------------------------------------
+# components = ["rancher", "gpu-operator", "local-path-provisioner", "aif-operator"]  # the default
+
+# suse-storage (Longhorn) instead of local-path-provisioner. NOT a migration
+# from the default -- a new cluster, with a different default StorageClass
+# and no data carried across. cert-manager is still injected automatically
+# because "rancher" is listed.
+# components = ["rancher", "suse-storage", "aif-operator"]
+
+# cluster_name        = "suse-ai-factory"
+# control_plane_count = 3
+# control_plane_plan  = "vx1-g-4c-16g-240s"
+# jumphost_plan       = "vc2-6c-16gb"
+# jumphost_username   = "suse"  # non-root login on the jumphost, with passwordless
+                                 # sudo and the same SSH keys. "" for root-only; the
+                                 # elemental nodes are root-only either way
+# image_disk_size     = "8G"  # size of the built raw/snapshot only -- the running node's
+                               # disk gets expanded to the actual instance's real disk at
+                               # first boot regardless of this value

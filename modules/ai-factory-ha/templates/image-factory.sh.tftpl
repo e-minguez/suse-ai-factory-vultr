@@ -1,0 +1,430 @@
+#!/usr/bin/env bash
+# Rendered into the jumphost's user_data by cloud-init and run under
+# nohup/setsid (see cloud-init.yaml.tftpl) so a build that takes tens of
+# minutes never blocks cloud-init itself. Builds the elemental raw image with
+# podman, serves it over plain HTTP for the import window only, imports it
+# into Vultr via create-from-url, and waits for that import to finish.
+set -euo pipefail
+
+exec >> "${log_file}" 2>&1
+
+log() {
+  echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"
+}
+
+VULTR_API_KEY="${vultr_api_key}"
+
+# Every api.vultr.com call below forces -4: instances are dual-stack even
+# without enable_ipv6, and an IP-restricted API key then gets 401 "Unauthorized
+# IP address: <ipv6>" because the request never went out over IPv4.
+RULE_ID=""
+SERVER_PID=""
+SERVE_DIR="/srv/img/${serve_path}"
+FIREWALLD_OPENED=false
+
+# Closes both firewalls, stops the server and removes the raw on any exit path,
+# so a crash never leaves the image served behind a closing firewall rule.
+cleanup() {
+  status=$?
+  if [ -n "$RULE_ID" ]; then
+    log "cleanup: deleting firewall rule $RULE_ID from group ${firewall_group_id}"
+    deleted=false
+    for attempt in 1 2 3; do
+      if curl -4 -fsS -X DELETE \
+        -H "Authorization: Bearer $VULTR_API_KEY" \
+        "https://api.vultr.com/v2/firewalls/${firewall_group_id}/rules/$RULE_ID"; then
+        deleted=true
+        break
+      fi
+      log "cleanup: delete attempt $attempt failed, retrying"
+      sleep 5
+    done
+    if [ "$deleted" != true ]; then
+      log "CRITICAL: could not delete firewall rule $RULE_ID on group ${firewall_group_id} after 3 attempts -- port 80 is still open to 0.0.0.0/0. Delete it manually."
+      status=1
+    fi
+  fi
+  if [ "$FIREWALLD_OPENED" = true ]; then
+    log "cleanup: closing port 80 in firewalld"
+    firewall-cmd --zone=public --remove-port=80/tcp \
+      || log "cleanup: firewall-cmd --remove-port failed (continuing)"
+  fi
+  if [ -n "$SERVER_PID" ]; then
+    log "cleanup: stopping http server (pid $SERVER_PID)"
+    kill "$SERVER_PID" 2>/dev/null || true
+  fi
+  rm -f "$SERVE_DIR/image.raw"
+  exit $status
+}
+trap cleanup EXIT
+
+log "=== image-factory starting ==="
+
+log "step 1/13: refreshing repos and installing podman, python3, curl"
+zypper -n --gpg-auto-import-keys refresh \
+  || log "zypper refresh reported a non-zero exit, continuing"
+# python3, not python3-base: the base-vs-full split of http.server/json has
+# moved across openSUSE releases. PyYAML is only used by step 5's override but
+# is installed unconditionally, so that path can't fail on a missing module.
+zypper -n install podman python3 python3-PyYAML curl \
+  || log "zypper install reported a non-zero exit (packages may already be present), continuing"
+
+log "step 2/13: enabling podman.socket"
+systemctl enable --now podman.socket
+
+log "step 3/13: opening port 80 ahead of the build"
+# Two firewalls sit in front of this port and Vultr's fetcher needs both open:
+# the cloud firewall group (below) and firewalld, which Leap 16 ships active.
+#
+# OPENED BEFORE THE BUILD, NOT JUST BEFORE THE IMPORT. The cloud firewall is a
+# distributed filter -- a rule created seconds before create-from-url is not
+# necessarily in force at the edge the fetcher arrives through, and the import
+# then fails with no connection ever made. Opening here
+# buys the whole build as propagation time and costs nothing, since $SERVE_DIR
+# does not exist until step 8.
+#
+# No --permanent: runtime-only changes apply without a reload, and the EXIT
+# trap undoes both.
+if command -v firewall-cmd >/dev/null && systemctl is-active --quiet firewalld; then
+  log "opening port 80 in firewalld"
+  firewall-cmd --zone=public --add-port=80/tcp
+  FIREWALLD_OPENED=true
+else
+  log "firewalld not present/active, nothing to open there"
+fi
+
+log "opening port 80 on Vultr firewall group ${firewall_group_id}"
+FW_RESPONSE=$(curl -4 -fsS -X POST \
+  -H "Authorization: Bearer $VULTR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"ip_type":"v4","protocol":"tcp","subnet":"0.0.0.0","subnet_size":0,"port":"80","notes":"elemental image import"}' \
+  "https://api.vultr.com/v2/firewalls/${firewall_group_id}/rules")
+log "firewall rule create response: $FW_RESPONSE"
+RULE_ID=$(python3 -c 'import json,sys
+d = json.loads(sys.argv[1])
+print(d.get("firewall_rule", {}).get("id", ""))' "$FW_RESPONSE")
+if [ -z "$RULE_ID" ]; then
+  log "ERROR: could not parse a firewall rule id out of the response above"
+  exit 1
+fi
+log "firewall rule id: $RULE_ID (cleaned up on exit by the trap)"
+
+log "step 4/13: pulling ${elemental_image}"
+podman pull "${elemental_image}"
+
+log "step 5/13: fetching the release manifest from ${aif_release_manifest_url}"
+# Curled rather than embedded in cloud-init: several KB against the 32 KiB
+# user_data ceiling, for no benefit -- the jumphost needs network access anyway.
+curl -fsS -o "${config_dir}/release_manifest.aif.yaml" "${aif_release_manifest_url}"
+
+# Two independent rewrites of the fetched manifest, in one Python step:
+#
+#  1. Core platform override (var.core_platform_override). Empty means "not
+#     set". When set, the two-level chain is FLATTENED into one local core
+#     manifest rather than redirected, because the resolver hard-forces an
+#     oci:// prefix onto corePlatform.image -- only the top-level manifestURI
+#     takes file://. release.yaml needs no change: the same path now holds a
+#     core manifest, and the resolver accepts either kind.
+#
+#  2. Systemd extension image overrides (var.sysext_image_overrides). The
+#     manifest pins each extension's OCI image and release.yaml has no field
+#     to override it, so the only place to change it is here.
+#
+# Either one alone is enough to need the rewrite; with neither, the fetched
+# manifest is used byte for byte.
+CORE_OS_BASE="${core_os_image_base}"
+CORE_OS_ISO="${core_os_image_iso}"
+CORE_K8S_VERSION="${core_k8s_version}"
+CORE_K8S_IMAGE="${core_k8s_image}"
+# Single-quoted: the value is JSON, full of double quotes. Both the keys and
+# the values are validated quote-free and whitespace-free in variables.tf.
+SYSEXT_OVERRIDES='${sysext_image_overrides_json}'
+
+if [ -z "$CORE_OS_ISO" ] && [ "$SYSEXT_OVERRIDES" = "{}" ]; then
+  log "no core platform override and no sysext image overrides -- using the AIF manifest chain unmodified"
+  mv "${config_dir}/release_manifest.aif.yaml" "${config_dir}/release_manifest.yaml"
+else
+  if [ -n "$CORE_OS_ISO" ]; then
+    log "core platform override set -- flattening AIF manifest onto OS image $CORE_OS_ISO"
+  else
+    log "no core platform override -- keeping the AIF manifest chain, rewriting extension images only"
+  fi
+  [ "$SYSEXT_OVERRIDES" = "{}" ] || log "sysext image overrides: $SYSEXT_OVERRIDES"
+
+  python3 - "${config_dir}" "$CORE_OS_BASE" "$CORE_OS_ISO" \
+            "$CORE_K8S_VERSION" "$CORE_K8S_IMAGE" "${cluster_name}" \
+            "$SYSEXT_OVERRIDES" <<'PYEOF'
+import json, sys, yaml
+
+config_dir, base, iso, kver, kimage, cluster, sysext_json = sys.argv[1:8]
+overrides = json.loads(sysext_json)
+
+with open(config_dir + "/release_manifest.aif.yaml") as f:
+    aif = yaml.safe_load(f) or {}
+
+components = aif.get("components") or {}
+
+# Rewrite extension images in place, BEFORE the flatten below copies
+# components.systemd across, so one edit covers both output shapes.
+#
+# Unknown names are fatal. A typo here would otherwise override nothing at all
+# and leave the build to fail forty minutes later on the node, as a missing
+# binary inside a crash-looping pod -- which is exactly how the open-iscsi
+# problem presented the first time.
+#
+# The variable ships a non-empty default, so this can also fire on a manifest
+# that simply does not declare the extension rather than on a typo. The message
+# names the escape hatch for that case.
+if overrides:
+    extensions = (components.get("systemd") or {}).get("extensions") or []
+    known = {e.get("name") for e in extensions if e.get("name")}
+    unknown = sorted(set(overrides) - known)
+    if unknown:
+        sys.exit(
+            "sysext_image_overrides names extension(s) absent from the release "
+            "manifest: %s. The manifest declares: %s. Fix the name, or set "
+            "sysext_image_overrides = {} to follow this manifest's own pins."
+            % (", ".join(unknown), ", ".join(sorted(known)) or "(none)")
+        )
+    for extension in extensions:
+        name = extension.get("name")
+        if name in overrides:
+            print("overriding extension %s: %s -> %s"
+                  % (name, extension.get("image"), overrides[name]))
+            extension["image"] = overrides[name]
+
+if iso:
+    # schema omitted deliberately: a manifest without one defaults to v0, the
+    # only version whose core Components type this script knows how to
+    # populate.
+    manifest = {
+        "metadata": {
+            "name": cluster + "-core-platform",
+            # v0 requires a version; reuse the AIF manifest's so the generated
+            # file still traces back to the chart set it carries.
+            "version": str((aif.get("metadata") or {}).get("version", "0.0.0")),
+        },
+        "components": {
+            "operatingSystem": {"image": {"base": base, "iso": iso}},
+            "kubernetes": {"version": kver, "image": kimage},
+        },
+    }
+
+    # Everything the solution manifest contributed beyond corePlatform.image; a
+    # v0 core manifest's Components accepts the same systemd/helm types.
+    for key in ("systemd", "helm"):
+        value = components.get(key)
+        if value:
+            manifest["components"][key] = value
+else:
+    # No flatten: hand back the solution manifest as fetched, minus the
+    # extension images just rewritten. Comments do not survive the round trip
+    # through yaml, which costs nothing -- the resolver never reads them.
+    manifest = aif
+
+with open(config_dir + "/release_manifest.yaml", "w") as f:
+    yaml.safe_dump(manifest, f, sort_keys=False)
+PYEOF
+  rm -f "${config_dir}/release_manifest.aif.yaml"
+  log "generated release manifest:"
+  cat "${config_dir}/release_manifest.yaml"
+fi
+
+log "step 6/13: running elemental customize against ${config_dir}"
+# No --local and no podman.sock mount: --local expects every OCI image
+# elemental3 unpacks at build time -- not just ${elemental_image} -- to already
+# be in the local store, erroring "No such image" instead of pulling, and there
+# is no confirmed list of which images that covers. The build runs once per
+# apply, so --local's faster-repeat-build benefit buys nothing here.
+#
+# --security-opt label=disable: Leap 16 defaults to SELinux enforcing. The
+# container already needs broad access to build a raw disk image.
+podman run --rm \
+  --security-opt label=disable \
+  -v "${config_dir}:/config" \
+  "${elemental_image}" customize --type raw
+
+log "step 7/13: locating produced raw image"
+RAW_IMAGE=$(ls -t "${config_dir}"/image-*.raw 2>/dev/null | head -n1 || true)
+if [ -z "$RAW_IMAGE" ]; then
+  log "ERROR: no ${config_dir}/image-*.raw produced by elemental customize"
+  exit 1
+fi
+log "found raw image: $RAW_IMAGE"
+
+log "step 8/13: serving raw image over http"
+mkdir -p "$SERVE_DIR"
+mv "$RAW_IMAGE" "$SERVE_DIR/image.raw"
+# Apparent size first: that is what the fetcher pulls, and a truncated or empty
+# raw is the other way an import fails -- the loopback check below answers 200
+# for a zero-byte file just as happily.
+log "raw image: $(du -h --apparent-size "$SERVE_DIR/image.raw" | cut -f1) apparent, $(du -h "$SERVE_DIR/image.raw" | cut -f1) on disk"
+# An empty index.html suppresses http.server's directory listing, which would
+# otherwise hand the random path to anyone scanning during the import window.
+: > /srv/img/index.html
+
+python3 -m http.server 80 --bind 0.0.0.0 --directory /srv/img &
+SERVER_PID=$!
+log "http server started in background, pid $SERVER_PID"
+sleep 2
+
+if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+  log "ERROR: http server (pid $SERVER_PID) died immediately after starting -- check that python3's http.server module is installed"
+  exit 1
+fi
+if ! curl -fsS -o /dev/null "http://127.0.0.1/${serve_path}/image.raw"; then
+  log "ERROR: http server is running but the raw image is not fetchable at http://127.0.0.1/${serve_path}/image.raw"
+  exit 1
+fi
+log "http server confirmed serving the raw image"
+
+log "step 9/13: fetching this jumphost's public ip from metadata"
+PUBLIC_IP=$(curl -fsS http://169.254.169.254/v1/interfaces/0/ipv4/address)
+log "public ip: $PUBLIC_IP"
+
+log "step 10/13: requesting snapshot import from url"
+IMAGE_URL="http://$PUBLIC_IP/${serve_path}/image.raw"
+REQUEST_BODY=$(printf '{"url":"%s","description":"%s","uefi":true}' "$IMAGE_URL" "${snapshot_description}")
+# uefi is write-only in the Vultr API -- this line is the only record of it.
+log "create-from-url request body: $REQUEST_BODY"
+
+# The import is attempted more than once, because its dominant failure mode is
+# not a bad image: it is the firewall rule opened at step 3 not yet being in
+# force at the edge Vultr's fetcher arrives through, and that is INTERMITTENT
+# rather than a function of how long the rule has had.
+#
+# Both outcomes happen with identical timing: the same ~3 minutes between
+# instance creation and import can leave the access log holding nothing but
+# 127.0.0.1 on one run and complete on the first attempt on the next. Do not
+# read the step-3 placement as a propagation budget that a slow build
+# satisfies.
+#
+# So the retry is the actual remedy and opening early is only a cheap head
+# start. Each attempt is a fresh create-from-url, IMPORT_BACKOFF apart.
+#
+# Retrying is safe because Vultr DELETES the snapshot record when the fetch
+# fails: a failed attempt leaves nothing behind for the next one to collide
+# with. That matters -- two snapshots sharing this description would break
+# data.vultr_snapshot's single-match filter on the Terraform side.
+#
+# Only a vanished record is retried. A snapshot that exists and goes wrong
+# (unexpected status, a sustained API outage) still aborts on the spot.
+MAX_IMPORT_ATTEMPTS=3
+IMPORT_BACKOFF=90
+IMPORT_ATTEMPT=0
+SNAPSHOT_ID=""
+STATUS=""
+
+while [ "$IMPORT_ATTEMPT" -lt "$MAX_IMPORT_ATTEMPTS" ]; do
+  IMPORT_ATTEMPT=$((IMPORT_ATTEMPT + 1))
+  log "import attempt $IMPORT_ATTEMPT/$MAX_IMPORT_ATTEMPTS"
+
+  CREATE_RESPONSE=$(curl -4 -fsS -X POST \
+    -H "Authorization: Bearer $VULTR_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d "$REQUEST_BODY" \
+    "https://api.vultr.com/v2/snapshots/create-from-url")
+  log "create-from-url response: $CREATE_RESPONSE"
+
+  SNAPSHOT_ID=$(python3 -c 'import json,sys
+d = json.loads(sys.argv[1])
+print(d.get("snapshot", {}).get("id", ""))' "$CREATE_RESPONSE")
+  if [ -z "$SNAPSHOT_ID" ]; then
+    log "ERROR: could not parse a snapshot id out of the create-from-url response above"
+    exit 1
+  fi
+  log "snapshot id: $SNAPSHOT_ID"
+
+  log "step 11/13: polling snapshot status every 30s until complete"
+  MAX_ATTEMPTS=240 # 2h cap; Terraform's own wait-for-snapshot.sh has the real timeout
+  ATTEMPT=0
+  STATUS=""
+  # api.vultr.com returns 502 during platform maintenance windows, including
+  # mid-import. Aborting there would have the EXIT trap delete the
+  # served raw while the fetcher is still pulling it, so 5xx and transport
+  # failures (http_code 000) are retried and only a sustained outage is fatal.
+  TRANSIENT=0
+  MAX_TRANSIENT=20 # 10 minutes at 30s
+  while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
+    ATTEMPT=$((ATTEMPT + 1))
+    # Not -f: Vultr DELETES the snapshot record when its fetcher cannot retrieve
+    # the image, so a 404 on an id it handed us a minute ago means "the fetch
+    # never succeeded", not "bad id" -- diagnosed below rather than discarded.
+    HTTP_CODE=$(curl -4 -sS -o /tmp/snapshot-poll.json -w '%%{http_code}' \
+      -H "Authorization: Bearer $VULTR_API_KEY" \
+      "https://api.vultr.com/v2/snapshots/$SNAPSHOT_ID")
+
+    if [ "$HTTP_CODE" = "404" ]; then
+      log "snapshot $SNAPSHOT_ID no longer exists (HTTP 404). Vultr deletes the record when its fetcher cannot retrieve the image, so this means the import never got the file."
+      log "diagnosis: the http server's access log is interleaved into this file. Every 'GET /${serve_path}/image.raw' line above coming from 127.0.0.1 and none from any other address means Vultr's fetcher never connected -- i.e. port 80 is still blocked from the outside (Vultr firewall group ${firewall_group_id}, or firewalld) rather than the image being at fault."
+      log "the image URL Vultr was given was: $IMAGE_URL"
+      STATUS="vanished"
+      break
+    fi
+
+    case "$HTTP_CODE" in
+      200)
+        TRANSIENT=0
+        ;;
+      000 | 5??)
+        TRANSIENT=$((TRANSIENT + 1))
+        log "transient: polling snapshot $SNAPSHOT_ID returned HTTP $HTTP_CODE ($TRANSIENT/$MAX_TRANSIENT consecutive). Response: $(cat /tmp/snapshot-poll.json)"
+        if [ "$TRANSIENT" -ge "$MAX_TRANSIENT" ]; then
+          log "ERROR: the Vultr API has been unavailable for $MAX_TRANSIENT consecutive polls, giving up. The snapshot may still complete on Vultr's side -- check with 'vultr-cli snapshot list' before rebuilding."
+          exit 1
+        fi
+        sleep 30
+        continue
+        ;;
+      *)
+        log "ERROR: polling snapshot $SNAPSHOT_ID returned HTTP $HTTP_CODE. Response: $(cat /tmp/snapshot-poll.json)"
+        exit 1
+        ;;
+    esac
+
+    POLL_RESPONSE=$(cat /tmp/snapshot-poll.json)
+    STATUS=$(python3 -c 'import json,sys
+d = json.loads(sys.argv[1])
+print(d.get("snapshot", {}).get("status", ""))' "$POLL_RESPONSE")
+    log "poll $ATTEMPT/$MAX_ATTEMPTS: snapshot $SNAPSHOT_ID status=$STATUS"
+
+    case "$STATUS" in
+      complete)
+        break
+        ;;
+      pending)
+        sleep 30
+        ;;
+      *)
+        log "ERROR: snapshot $SNAPSHOT_ID reached unexpected/terminal status '$STATUS', aborting"
+        exit 1
+        ;;
+    esac
+  done
+
+  if [ "$STATUS" = "complete" ]; then
+    break
+  fi
+
+  if [ "$STATUS" != "vanished" ]; then
+    log "ERROR: snapshot $SNAPSHOT_ID did not reach 'complete' within $((MAX_ATTEMPTS * 30)) seconds (last status: $STATUS)"
+    exit 1
+  fi
+
+  if [ "$IMPORT_ATTEMPT" -lt "$MAX_IMPORT_ATTEMPTS" ]; then
+    log "waiting $IMPORT_BACKOFF s before import attempt $((IMPORT_ATTEMPT + 1))/$MAX_IMPORT_ATTEMPTS -- the raw is still being served and the firewall rule gets that much longer to reach the edge"
+    sleep "$IMPORT_BACKOFF"
+  fi
+done
+
+if [ "$STATUS" != "complete" ]; then
+  log "ERROR: the import failed $MAX_IMPORT_ATTEMPTS times -- Vultr's fetcher never retrieved http://$PUBLIC_IP/${serve_path}/image.raw."
+  log "If no 'GET /${serve_path}/image.raw' line above comes from an address other than 127.0.0.1, port 80 was never open from the outside for any attempt, and the cause is not propagation delay: check firewall group ${firewall_group_id} in the Vultr API and firewalld on this host."
+  exit 1
+fi
+
+log "step 12/13: snapshot complete"
+log "step 13/13: cleanup (firewall rule, http server, served raw) handled by the EXIT trap"
+
+log "=== image-factory finished successfully: snapshot $SNAPSHOT_ID ready ==="
+log "WARNING: this snapshot (description: ${snapshot_description}) is NOT managed by Terraform -- it was created directly via the Vultr API, and Terraform only ever READS it back (see snapshot.tf). 'terraform destroy' will NOT delete it, and every rebuild (a template edit, or ./deploy.sh --rebuild) creates a NEW snapshot under a different description without touching this one. Left alone, snapshots accumulate across rebuilds and keep billing. Check 'vultr-cli snapshot list' periodically and delete ones you no longer need by hand."

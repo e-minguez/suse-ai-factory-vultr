@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# write-node-ip.service (see butane.yaml.tftpl), a oneshot firstboot unit that
+# writes /etc/rancher/rke2/config.yaml.d/99-node-ip.yaml from Vultr's own
+# instance metadata, rather than from a hostname -> address table baked in at
+# plan time -- see the module README's "VPC addresses" section.
+#
+# RKE2 defaults node-ip to the default route's source address. On a vpc_only
+# node that is already the right (and only) address, and this file must NOT be
+# written there: overriding it would replace an address the load balancer can
+# reach with the CGNAT/DHCP-fallback one that NIC would get if anything
+# re-DHCPed it (see "WHY A vpc_only NIC IS LEFT ALONE" in
+# configure-network.sh.tftpl -- which is also why this script only ever WRITES
+# a file and never touches a NIC). A dual-NIC node (bare metal, or a gpu_cloud
+# pool with vpc_only = false) routes by default out its PUBLIC NIC, so without
+# this override it advertises its public IP to the cluster.
+#
+# WHAT DECIDES WHICH KIND OF NODE THIS IS -- and what emphatically does not.
+#
+# It is the count of physical NICs in /sys/class/net, read locally, always
+# available, and true the moment this unit runs.
+#
+# It is NOT the presence of /v1/interfaces/ in metadata. A vpc_only node
+# serves a perfectly good interface tree -- one entry, network-type "evpn",
+# empty gateway, empty netmask, and ipv4/address the literal string "dhcp".
+# Classifying that as "the VPC NIC, write its address" emits `node-ip: dhcp`,
+# on which rke2-server exits 1 with "invalid node-ip: invalid ip format
+# 'dhcp'" and never starts -- on every control plane at once. The tree does
+# 404 on vpc_only in the initrd, where configure-network.sh runs and metadata
+# is not yet reachable over the VPC NIC, but that is a timing property of the
+# initrd and does not hold for the rest of the boot.
+#
+# Hence also: an address from metadata is validated as a dotted quad before it
+# is used anywhere. "Non-empty" is not the same as "an IP address".
+#
+# This runs in the REAL root, ordered by butane.yaml.tftpl's unit to run before
+# rke2-server/rke2-agent/k8s-config-installer -- unlike configure-network.sh,
+# which runs under catalyst-net-initrd-script.service's sandbox (read-only
+# except /proc, /sys, /dev) and could never write here at all.
+set -euo pipefail
+
+METADATA_BASE="http://169.254.169.254/v1"
+CONFIG_DIR="/etc/rancher/rke2/config.yaml.d"
+CONFIG_FILE="$CONFIG_DIR/99-node-ip.yaml"
+
+log() {
+  echo "[write-node-ip] $*"
+}
+
+die() {
+  log "ERROR: $*"
+  exit 1
+}
+
+fetch() {
+  # $1 = path under $METADATA_BASE. Callers that treat absence as normal must
+  # add "|| true".
+  curl -fsS "$METADATA_BASE/$1"
+}
+
+# A dotted quad with every octet in range. Guards against metadata's "dhcp",
+# against an empty body, and against a 404 page arriving as a 200.
+is_ipv4() {
+  local candidate=$1 octet
+  [[ $candidate =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+  # Split on dots without tr/cut: set the field separator for one read.
+  local IFS=.
+  for octet in $candidate; do
+    # Strips any leading zeros before the comparison, and rejects "" safely.
+    [ "$((10#$octet))" -le 255 ] || return 1
+  done
+  return 0
+}
+
+physical_ifaces=0
+for sys_path in /sys/class/net/*/address; do
+  ifname=$${sys_path%/address}
+  ifname=$${ifname##*/}
+  # A real NIC has a backing device; skips lo and virtual interfaces.
+  [ -e "/sys/class/net/$ifname/device" ] || continue
+  physical_ifaces=$((physical_ifaces + 1))
+done
+log "found $physical_ifaces physical NIC(s) via /sys/class/net"
+
+if [ "$physical_ifaces" -le 1 ]; then
+  log "single NIC: vpc_only node, whose default route already points out the VPC NIC -- RKE2's own default node-ip is correct, writing nothing"
+  exit 0
+fi
+
+# Dual-NIC from here on. On bare metal the tree can lag several seconds behind
+# the VPC NIC being live -- the same lag configure-network.sh retries around --
+# so this waits rather than giving up.
+retry_attempt=0
+max_retry_attempts=10
+retry_sleep_seconds=3
+
+while :; do
+  iface_listing=$(fetch "interfaces/" || true)
+  [ -n "$iface_listing" ] && break
+
+  # Unlike the old version, running out of retries here is NOT "must be
+  # vpc_only, nothing to write" -- the NIC count above already ruled that out.
+  # A dual-NIC node with no interface metadata is an anomaly, and defaulting
+  # node-ip to the public NIC silently is worse than a failed unit.
+  [ "$retry_attempt" -lt "$max_retry_attempts" ] ||
+    die "no interface listing in metadata after $retry_attempt retries on a node with $physical_ifaces NICs"
+
+  retry_attempt=$((retry_attempt + 1))
+  log "no interface listing yet -- retrying in $${retry_sleep_seconds}s (attempt $retry_attempt/$max_retry_attempts)"
+  sleep "$retry_sleep_seconds"
+done
+
+vpc_address=""
+
+for entry in $iface_listing; do
+  n=$${entry%/}
+  [ -n "$n" ] || continue
+
+  # Same rule configure-network.sh's classification loop uses: a non-empty
+  # ipv4/gateway is the public NIC, an empty one is the VPC NIC -- the VPC
+  # hands out no gateway at all.
+  gateway=$(fetch "interfaces/$n/ipv4/gateway" || true)
+  [ -n "$gateway" ] && continue
+
+  address=$(fetch "interfaces/$n/ipv4/address" || true)
+  if ! is_ipv4 "$address"; then
+    # "dhcp" is what a DHCP-configured VPC attachment reports; anything else
+    # unparseable lands here too. Either way there is no static address to
+    # pin, so skip the NIC rather than write nonsense into RKE2's config.
+    log "interface $n has no gateway (private) but ipv4/address is '$address', not an IPv4 address -- skipping it"
+    continue
+  fi
+
+  vpc_address=$address
+  break
+done
+
+if [ -z "$vpc_address" ]; then
+  # Reached when every private NIC reported "dhcp". RKE2's default -- the
+  # default route's source, i.e. the PUBLIC NIC on a dual-NIC node -- is wrong
+  # here, but writing a guess would be worse, and an address discovered from
+  # the live interface could just as easily be the public one.
+  die "no interface with an empty gateway and a valid ipv4/address found among: $iface_listing"
+fi
+
+mkdir -p "$CONFIG_DIR"
+printf 'node-ip: %s\n' "$vpc_address" > "$CONFIG_FILE"
+log "wrote $CONFIG_FILE: node-ip: $vpc_address"

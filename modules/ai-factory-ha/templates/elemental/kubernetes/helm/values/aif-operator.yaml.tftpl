@@ -1,0 +1,15 @@
+credentials:
+  applicationCollection:
+    username: "${appco_username}"
+    password: "${appco_password}"
+  suseRegistry:
+    # The username for this registry is always the registration code itself.
+    username: "${suse_registration_code}"
+    password: "${suse_registry_password}"
+%{ if nvidia_api_key != null ~}
+  nvidia:
+    # NGC's own convention: the username is always the literal string
+    # "$oauthtoken", never a real account name.
+    username: "$oauthtoken"
+    password: "${nvidia_api_key}"
+%{ endif ~}

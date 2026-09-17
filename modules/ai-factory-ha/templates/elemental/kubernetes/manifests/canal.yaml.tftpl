@@ -1,0 +1,61 @@
+# RKE2's CNI is canal: Calico for policy and the pod veths, Flannel for the
+# VXLAN dataplane on flannel.1. Three of its defaults are wrong here, and all
+# three fail quietly.
+#
+# Despite its path in this tree, this file is NOT part of the elemental image.
+# It is written by per-node Ignition straight into RKE2's own
+# /var/lib/rancher/rke2/server/manifests, on servers only. The why -- a measured
+# 104-second race that this file used to lose -- is in locals.tf, at
+# node_server_manifests.
+#
+#  1. flannel.iface defaults to blank, which the chart documents as "the
+#     interface is chosen using the node's default route". On a vpc_only
+#     control plane that is the VPC NIC and comes out right by accident. On a
+#     dual-NIC node -- every bare metal GPU worker -- the default route is the
+#     PUBLIC NIC, so flannel annotated
+#     flannel.alpha.coreos.com/public-ip with the node's public address and the
+#     control planes put it in their FDB that way. Every pod packet between a
+#     GPU node and a control plane then leaves the VPC: out through the NAT
+#     gateway, across the public internet, back in on a NIC that has no Vultr
+#     firewall, as cleartext VXLAN on udp/8472.
+#
+#     99-node-ip.yaml does NOT prevent this. It pins kubelet's node-ip, which
+#     flannel never reads -- it picks its own VTEP source independently.
+#
+#     regexIface rather than iface because the value is cluster-wide and the
+#     NIC names are not: enp1s0 on the cloud control planes, enp1s0f1np1 on
+#     bare metal. flannel's --iface-regex matches "IP or name" (flannel
+#     main.go:122), so matching the VPC address range picks the right NIC on
+#     every node without naming any of them.
+#
+#  2. calico.vethuMTU defaults to 1450, which assumes a 1500 underlay. Vultr's
+#     VPC is 1450, so the VXLAN payload ceiling is 1400 and a pod handed a 1450
+#     veth overflows its own node's flannel.1 before the packet leaves the
+#     host.
+#
+#  3. calico.felixPrometheusMetricsEnabled defaults to true, which binds Felix's
+#     metrics endpoint to 0.0.0.0:9091. Harmless on the vpc_only control planes,
+#     but a bare metal GPU worker has a public NIC and no Vultr firewall behind
+#     which to hide it: nmap from off-cluster reports 9091/tcp open, owned by
+#     calico-node. Nothing in this stack scrapes it.
+#
+# Bouncing canal is required to pick any of these up on a RUNNING cluster: the
+# values land in the rke2-canal-config ConfigMap, which the DaemonSet reads
+# through env.valueFrom, so the pod template never changes and Helm has nothing
+# to roll. Irrelevant on a fresh build -- Ignition puts this on disk before RKE2
+# first starts -- but it is why a hot patch looks like a no-op.
+#
+# vethuMTU also only applies to veths created after the change, so on a running
+# cluster existing pods keep the old MTU until they are recreated.
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: rke2-canal
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    flannel:
+      regexIface: '${iface_regex}'
+    calico:
+      vethuMTU: ${veth_mtu}
+      felixPrometheusMetricsEnabled: false

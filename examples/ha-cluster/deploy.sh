@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+#
+# Two-pass apply for the HA cluster example.
+#
+# WHY TWO PASSES:
+# The load balancer's backend list (attached_instances) is an inline field
+# of vultr_load_balancer, not a separate resource — so "create the LB" and
+# "attach the backends" are one node in Terraform's graph. Wiring
+# attached_instances straight to vultr_instance.control_plane[*].id would
+# close a dependency cycle:
+#
+#   LB (attached_instances) -> control-plane instances -> snapshot ->
+#   jumphost (needs the LB's IP baked into the image) -> back to the LB
+#
+# The module breaks the cycle by taking the backend list out of the graph:
+# lb_backend_instance_ids and lb_supervisor_extra_cidrs are plain variables
+# (default []), not references. Pass 1 stands up everything with an empty
+# backend list; pass 2 feeds the real values back in, sourced from pass 1's
+# own outputs. Both passes are safe to re-run — the snapshot wait is a no-op
+# once the snapshot already exists.
+#
+# Pass 2's values are written to pass2.auto.tfvars.json rather than passed as
+# -var on the command line: Terraform auto-loads any *.auto.tfvars.json in
+# the working directory on every subsequent plan/apply, whereas a -var flag
+# is gone the moment the command exits. Without this file, a plain
+# `terraform apply` run any time after deploy.sh finishes would see
+# lb_backend_instance_ids revert to its [] default and silently detach every
+# control-plane node from the load balancer.
+#
+# THIS SCRIPT RESETS THAT FILE TO EMPTY BEFORE PASS 1 RUNS, every time.
+# Reason, found the hard way: lb_backend_instance_ids is a plain variable,
+# not a reference to vultr_instance.control_plane -- Terraform has no
+# dependency edge telling it those specific IDs are about to stop existing
+# whenever something (a new snapshot from a rebuilt image, a plan change,
+# anything ForceNew) replaces the control-plane/GPU nodes. Without the
+# reset, a stale pass2.auto.tfvars.json left over from a previous run makes
+# pass 1 destroy the old instances and then try to attach those same
+# now-deleted IDs to the load balancer in the same apply, which Vultr
+# rejects with a 422 "Invalid Instance IDs" -- and the apply aborts with
+# the old nodes already gone and their replacements never created. Starting
+# every pass 1 from an empty backend list (matching the variables' own
+# defaults) makes that failure mode structurally impossible: pass 1 never
+# has stale IDs to fight with, and pass 2 (right after, same invocation)
+# regenerates the file from that run's own fresh outputs regardless.
+#
+# lb_backend_instance_ids feeds BOTH load balancers -- the API one and the
+# ingress one, which share the same control-plane backends.
+#
+# The cost of the reset: EVERY run of this script now detaches the load
+# balancers' backends at the start of pass 1 and reattaches them at the end
+# of pass 2, even a fully idempotent re-run where nothing about the
+# control-plane/GPU nodes actually changes. That is a real, brief outage
+# window on 6443/9345 and on 80/443 every run, not just ones with node
+# replacement -- traded
+# deliberately for never again failing an apply mid-replace with the old
+# nodes already destroyed and their successors never created.
+#
+# WHAT TO EXPECT:
+# Pass 1 blocks for tens of minutes with NO console output while the
+# jumphost builds the elemental image (podman pull + customize) and Vultr
+# imports the resulting raw as a snapshot. This is normal. From another
+# terminal, watch progress with:
+#
+#   ssh root@<jumphost_public_ipv4> tail -f /var/log/elemental-factory.log
+#
+# Between pass 1 and pass 2 both load balancers exist but have zero backends,
+# so `curl https://<lb-ip>:6443` or a port scan against :6443 will show a
+# dead/refused connection. That is expected, not a failure — it clears up
+# once pass 2 attaches the control-plane nodes and GPU CIDRs. The ingress
+# load balancer stays down longer still: its health check is Traefik's own
+# /ping, which only answers once the cluster has finished deploying charts.
+#
+# WHY THIS SCRIPT PINS snapshot_id IN pass2.auto.tfvars.json, ON BOTH PASSES:
+# data.vultr_snapshot.ai_factory's read is deferred to apply time via
+# depends_on (needed on a genuine first build, since the snapshot doesn't
+# exist yet at plan time). Terraform defers a depends_on data source's read
+# whenever anything in its dependency chain shows pending changes in that
+# plan -- and vultr_instance.jumphost's user_data embeds the load balancer's
+# ipv4, which is a real config reference, so LB -> jumphost -> the wait
+# resource -> this data source is a genuine graph edge. The reset below
+# (attached_instances/firewall_rules back to []) means the LB itself has
+# pending changes on the very first plan of EVERY run -- which is enough to
+# defer the data source's read on pass 1 too, not just pass 2, making
+# local.effective_snapshot_id "known after apply" and forcing a full
+# ForceNew replace of every control-plane/GPU node, every single run, even
+# ones with zero real config changes.
+#
+# Fix: before pass 1, look up whatever snapshot_id is already recorded in
+# this directory's OWN state (a plain `terraform output`, which reads the
+# last-applied state file directly -- no plan/refresh involved, so nothing
+# here can itself trigger the bug). If one exists, write it into the SAME
+# reset of pass2.auto.tfvars.json below, alongside the emptied backend
+# lists: a literal string there is known at plan time on pass 1 too (the
+# file is auto-loaded, not just written for pass 2), which drops
+# data.vultr_snapshot.ai_factory and terraform_data.snapshot_ready to
+# count = 0 (var.snapshot_id overrides them, per snapshot.tf) and removes
+# the deferred-read path from the graph entirely for this run. When no
+# snapshot_id is recorded yet, or --rebuild was passed, the key is left out
+# of the file entirely (absent, not null, so var.snapshot_id's own default
+# applies) -- a bare -var "snapshot_id=" would not have that option, which is
+# why this uses the tfvars file for pass 1 too rather than a second -var flag.
+#
+# This means a routine re-run never rebuilds the image or touches running
+# nodes, by default. To force an actual rebuild (e.g. after changing
+# anything under modules/ai-factory-ha/templates), run:
+#
+#   ./deploy.sh --rebuild
+#
+# which skips the pin on pass 1 and lets Terraform's own time_static.build
+# triggers decide, as originally designed, whether a new image is needed.
+# Pass 2 always re-pins from that run's own resolved output regardless, same
+# as before -- see the end of this script.
+#
+# USAGE:
+#   ./deploy.sh [--rebuild] [--yes] [-- | terraform apply args...]
+#
+# Double-dash flags are this script's own and are consumed here; everything
+# else is forwarded verbatim to both `terraform apply` calls. An unrecognised
+# --flag is a hard error rather than being forwarded, so a typo surfaces here
+# instead of as a confusing Terraform error. Use `--` to stop flag parsing.
+
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: ./deploy.sh [--rebuild] [--yes] [terraform apply args...]
+
+  --rebuild   Do not pin the snapshot already in state; let Terraform's
+              time_static.build triggers decide whether to build a fresh
+              image. Only meaningful when a cluster is already standing --
+              from an empty state every run builds fresh anyway.
+  --yes       Pass -auto-approve to both terraform apply passes.
+  --help      Show this message.
+  --          Stop parsing this script's flags; forward the rest verbatim.
+
+Any other argument is forwarded to both `terraform apply` invocations.
+USAGE
+}
+
+REBUILD=false
+TF_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --rebuild) REBUILD=true; shift ;;
+    --yes) TF_ARGS+=(-auto-approve); shift ;;
+    --help | -h)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      TF_ARGS+=("$@")
+      break
+      ;;
+    --*)
+      echo "ERROR: unknown option '$1'." >&2
+      echo >&2
+      usage >&2
+      exit 2
+      ;;
+    *) TF_ARGS+=("$1"); shift ;;
+  esac
+done
+
+if [[ -z "${VULTR_API_KEY:-}" ]]; then
+  echo "ERROR: VULTR_API_KEY is not set." >&2
+  echo "Both the vultr provider and the module's scripts/wait-for-snapshot.sh need it in the environment." >&2
+  exit 1
+fi
+
+EXISTING_SNAPSHOT_ID=""
+if [[ "$REBUILD" == true ]]; then
+  echo "==> --rebuild requested: not pinning snapshot_id, letting Terraform build+detect a fresh image"
+else
+  EXISTING_SNAPSHOT_ID=$(terraform output -raw snapshot_id 2>/dev/null || true)
+  if [[ -n "$EXISTING_SNAPSHOT_ID" ]]; then
+    echo "==> Reusing existing snapshot $EXISTING_SNAPSHOT_ID for pass 1 too (pass --rebuild to force a fresh image build)"
+  fi
+fi
+
+echo "==> Resetting pass2.auto.tfvars.json to empty before pass 1 (see the comment above for why)"
+if [[ -n "$EXISTING_SNAPSHOT_ID" ]]; then
+  # snapshot_id present: pins pass 1 too, see the WHY comment above.
+  cat > pass2.auto.tfvars.json <<EOF
+{
+  "lb_backend_instance_ids": [],
+  "lb_supervisor_extra_cidrs": [],
+  "gpu_cloud_extra_cidrs": [],
+  "snapshot_id": "$EXISTING_SNAPSHOT_ID"
+}
+EOF
+else
+  # No recorded snapshot (first run) or --rebuild: the key is left out
+  # entirely, not set to null, so var.snapshot_id's own default applies and
+  # Terraform's time_static.build triggers decide as originally designed.
+  cat > pass2.auto.tfvars.json <<'EOF'
+{
+  "lb_backend_instance_ids": [],
+  "lb_supervisor_extra_cidrs": [],
+  "gpu_cloud_extra_cidrs": []
+}
+EOF
+fi
+
+echo "==> Pass 1: network, load balancer, jumphost image factory, control-plane + GPU nodes"
+echo "    (this blocks for tens of minutes once the jumphost starts building the image;"
+echo "     watch it with: ssh root@<jumphost_public_ipv4> tail -f /var/log/elemental-factory.log)"
+terraform apply ${TF_ARGS[@]+"${TF_ARGS[@]}"}
+
+RESOLVED_SNAPSHOT_ID=$(terraform output -raw snapshot_id)
+
+echo "==> Pass 2: attach load balancer backends (API + ingress) and GPU supervisor CIDRs"
+echo "    (neither LB has backends until this completes — a dead :6443 in between is expected)"
+# snapshot_id pins the value pass 1 just resolved, so pass 2 (and every plain
+# plan/apply after it, since this file is auto-loaded) never re-reads
+# data.vultr_snapshot.ai_factory -- see the WHY comment above.
+cat > pass2.auto.tfvars.json <<EOF
+{
+  "lb_backend_instance_ids": $(terraform output -json control_plane_ids),
+  "lb_supervisor_extra_cidrs": $(terraform output -json gpu_node_cidrs),
+  "gpu_cloud_extra_cidrs": $(terraform output -json nat_gateway_public_cidrs),
+  "snapshot_id": "$RESOLVED_SNAPSHOT_ID"
+}
+EOF
+terraform apply ${TF_ARGS[@]+"${TF_ARGS[@]}"}
+
+echo "==> Done. See outputs for jumphost_public_ipv4, kubernetes_api_endpoint, api_vip,"
+echo "    ingress_lb_ipv4 and rancher_url."
+echo "==> pass2.auto.tfvars.json now pins the load balancer's backends for every future"
+echo "    plan/apply in this directory — do not delete it, and re-run this script (not a"
+echo "    bare 'terraform apply') if control-plane or GPU nodes are ever replaced."
