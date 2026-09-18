@@ -12,6 +12,11 @@
 !*.tfvars.example
 !*.tfvars.json.example
 
+# Parser fixtures for tools/cost. Placeholder values only -- the redaction
+# test needs credential-SHAPED strings, so they must not look like the real
+# thing either. Exempted because *.tfvars above would otherwise swallow them.
+!tools/cost/**/testdata/**
+
 # Written by examples/ha-cluster/deploy.sh's second pass; holds live
 # instance IDs/CIDRs, not secrets, but is generated and per-deployment.
 *.auto.tfvars.json
@@ -75,6 +80,9 @@ modules/**/.terraform.lock.hcl
 *.raw
 *.iso
 *.qcow2
+
+# Built cost-estimator binary.
+tools/cost/cost
 
 # Editor, tooling and OS noise.
 .claude/

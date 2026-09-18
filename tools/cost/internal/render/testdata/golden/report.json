@@ -1,0 +1,237 @@
+{
+  "region": "ams",
+  "cluster_name": "suse-ai-factory",
+  "catalog": {
+    "source": "file"
+  },
+  "durations": [
+    "1h",
+    "8h",
+    "24h",
+    "7d",
+    "30d"
+  ],
+  "resources": [
+    {
+      "resource": "jumphost",
+      "plan_id": "vc2-6c-16gb",
+      "qty": 1,
+      "plan_found": true,
+      "invoice_type": "monthly",
+      "hourly_usd": 0.11,
+      "monthly_usd": 80,
+      "regional": false,
+      "costs_usd": {
+        "1h": 0.11,
+        "24h": 2.64,
+        "30d": 79.2,
+        "7d": 18.48,
+        "8h": 0.88
+      },
+      "capped": {
+        "1h": false,
+        "24h": false,
+        "30d": false,
+        "7d": false,
+        "8h": false
+      }
+    },
+    {
+      "resource": "control plane",
+      "plan_id": "vx1-g-4c-16g-240s",
+      "qty": 3,
+      "plan_found": true,
+      "invoice_type": "hourly",
+      "hourly_usd": 0.153,
+      "monthly_usd": 111.69,
+      "regional": false,
+      "costs_usd": {
+        "1h": 0.459,
+        "24h": 11.016,
+        "30d": 330.48,
+        "7d": 77.112,
+        "8h": 3.672
+      },
+      "capped": {
+        "1h": false,
+        "24h": false,
+        "30d": false,
+        "7d": false,
+        "8h": false
+      }
+    },
+    {
+      "resource": "gpu bare metal / gpu",
+      "pool": "gpu",
+      "plan_id": "vbm-6c-32gb-amd",
+      "qty": 0,
+      "plan_found": true,
+      "invoice_type": "monthly",
+      "hourly_usd": 0.41,
+      "monthly_usd": 295,
+      "regional": false,
+      "costs_usd": {
+        "1h": 0,
+        "24h": 0,
+        "30d": 0,
+        "7d": 0,
+        "8h": 0
+      },
+      "capped": {
+        "1h": false,
+        "24h": false,
+        "30d": true,
+        "7d": false,
+        "8h": false
+      }
+    },
+    {
+      "resource": "gpu cloud / cgpu",
+      "pool": "cgpu",
+      "plan_id": "voc-c-4c-8gb-150s-amd",
+      "qty": 1,
+      "plan_found": true,
+      "invoice_type": "monthly",
+      "hourly_usd": 0.123,
+      "monthly_usd": 90,
+      "regional": false,
+      "costs_usd": {
+        "1h": 0.123,
+        "24h": 2.952,
+        "30d": 88.56,
+        "7d": 20.664,
+        "8h": 0.984
+      },
+      "capped": {
+        "1h": false,
+        "24h": false,
+        "30d": false,
+        "7d": false,
+        "8h": false
+      }
+    },
+    {
+      "resource": "load balancer (api)",
+      "qty": 1,
+      "plan_found": true,
+      "invoice_type": "monthly",
+      "hourly_usd": 0.015,
+      "monthly_usd": 10,
+      "regional": false,
+      "costs_usd": {
+        "1h": 0.015,
+        "24h": 0.36,
+        "30d": 10,
+        "7d": 2.52,
+        "8h": 0.12
+      },
+      "capped": {
+        "1h": false,
+        "24h": false,
+        "30d": true,
+        "7d": false,
+        "8h": false
+      }
+    },
+    {
+      "resource": "load balancer (ingress)",
+      "qty": 1,
+      "plan_found": true,
+      "invoice_type": "monthly",
+      "hourly_usd": 0.015,
+      "monthly_usd": 10,
+      "regional": false,
+      "costs_usd": {
+        "1h": 0.015,
+        "24h": 0.36,
+        "30d": 10,
+        "7d": 2.52,
+        "8h": 0.12
+      },
+      "capped": {
+        "1h": false,
+        "24h": false,
+        "30d": true,
+        "7d": false,
+        "8h": false
+      }
+    },
+    {
+      "resource": "nat gateway",
+      "qty": 1,
+      "plan_found": true,
+      "invoice_type": "monthly",
+      "hourly_usd": 0.03,
+      "monthly_usd": 20,
+      "regional": false,
+      "costs_usd": {
+        "1h": 0.03,
+        "24h": 0.72,
+        "30d": 20,
+        "7d": 5.04,
+        "8h": 0.24
+      },
+      "capped": {
+        "1h": false,
+        "24h": false,
+        "30d": true,
+        "7d": false,
+        "8h": false
+      }
+    },
+    {
+      "resource": "snapshot storage",
+      "qty": 1,
+      "plan_found": true,
+      "hourly_usd": 0,
+      "regional": false,
+      "costs_usd": {
+        "1h": 0.000548,
+        "24h": 0.013151,
+        "30d": 0.394521,
+        "7d": 0.092055,
+        "8h": 0.004384
+      },
+      "capped": {
+        "1h": false,
+        "24h": false,
+        "30d": false,
+        "7d": false,
+        "8h": false
+      }
+    },
+    {
+      "resource": "vpc / firewall groups+rules",
+      "qty": 1,
+      "plan_found": true,
+      "hourly_usd": 0,
+      "regional": false,
+      "costs_usd": {
+        "1h": 0,
+        "24h": 0,
+        "30d": 0,
+        "7d": 0,
+        "8h": 0
+      },
+      "capped": {
+        "1h": false,
+        "24h": false,
+        "30d": false,
+        "7d": false,
+        "8h": false
+      }
+    }
+  ],
+  "totals_usd": {
+    "1h": 0.752548,
+    "24h": 18.061151,
+    "30d": 538.634521,
+    "7d": 126.428055,
+    "8h": 6.020384
+  },
+  "recurring_after_destroy": {
+    "snapshot_storage_usd_per_month": 0.4
+  },
+  "incomplete": false,
+  "warnings": []
+}
