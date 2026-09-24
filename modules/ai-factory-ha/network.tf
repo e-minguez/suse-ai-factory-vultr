@@ -118,8 +118,13 @@ resource "vultr_load_balancer" "api" {
 # pinned to them (kubernetes/manifests/traefik.yaml) -- so the same pass-2
 # variable fills both. Created unconditionally alongside the API LB, before the
 # jumphost, because its address is baked into the image as Rancher's hostname.
+#
+# Traefik only: the proxy protocol and /ping:8080 health check below are a pair
+# with kubernetes/manifests/traefik.yaml, which only exists for traefik. Under
+# ingress-nginx nothing listens on 8080 and nothing strips the PROXY header, so
+# this LB would mark every backend down.
 resource "vultr_load_balancer" "ingress" {
-  count = var.ingress_controller == "none" ? 0 : 1
+  count = var.ingress_controller == "traefik" ? 1 : 0
 
   region              = var.region
   label               = "${var.cluster_name}-ingress-lb"

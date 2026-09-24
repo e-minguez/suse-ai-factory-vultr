@@ -38,10 +38,13 @@ locals {
       nodeport   = { protocol = "tcp", port = "30000:32767" }
     },
     # The ingress controller's hostPorts, plus Traefik's /ping entrypoint --
-    # all three reached from the ingress load balancer, which sits in the VPC.
+    # reached from the ingress load balancer, which sits in the VPC. 8080 is
+    # traefik-only: that is the only controller the ingress LB exists for.
     var.ingress_controller == "none" ? {} : {
-      http         = { protocol = "tcp", port = "80" }
-      https        = { protocol = "tcp", port = "443" }
+      http  = { protocol = "tcp", port = "80" }
+      https = { protocol = "tcp", port = "443" }
+    },
+    var.ingress_controller != "traefik" ? {} : {
       ingress_ping = { protocol = "tcp", port = "8080" }
     },
   )

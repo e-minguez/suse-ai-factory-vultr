@@ -24,7 +24,7 @@ output "api_host" {
 }
 
 output "ingress_lb_ipv4" {
-  description = "The ingress load balancer's IPv4 -- 80/443 forwarded to Traefik on the control-plane nodes. null when ingress_controller is \"none\"."
+  description = "The ingress load balancer's IPv4 -- 80/443 forwarded to Traefik on the control-plane nodes. null unless ingress_controller is \"traefik\"."
   value       = module.ha_cluster.ingress_lb_ipv4
 }
 
