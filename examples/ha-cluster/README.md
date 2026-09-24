@@ -363,7 +363,9 @@ done
 ```
 
 The module runs this check itself during `plan` (`verify_plan_availability`,
-default `true`) and names the offending pool when a plan is missing.
+default `true`) and names the offending pool when a plan is missing. Pools
+with `count = 0` are skipped, so a pool can be parked at 0 while its plan is
+out of stock.
 
 ### `elemental_image`'s default, and why it isn't the `:3.0` release
 

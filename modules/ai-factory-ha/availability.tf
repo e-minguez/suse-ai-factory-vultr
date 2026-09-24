@@ -10,7 +10,10 @@
 #
 # The endpoint scopes its answer to one plan family, so all five cloud
 # families are queried and unioned -- querying only vc2 reports a real,
-# available vx1 plan as unavailable. GPU families (vbm, vdm, vcg) are checked
+# available vx1 plan as unavailable. A single family coming back empty is
+# routine (mad has returned zero vx1 plans with a valid key), so the
+# missing-key heuristic only fires when the UNION is empty -- see
+# cloud_plan_availability_check below. GPU families (vbm, vdm, vcg) are checked
 # separately below, per pool, and are deliberately NOT unioned into this list:
 # a GPU plan is only valid for the resource family it belongs to.
 #
@@ -38,12 +41,6 @@ data "http" "cloud_plan_availability" {
       condition     = self.status_code == 200
       error_message = "Vultr availability API returned HTTP ${self.status_code} for region \"${var.region}\" (type=${each.key}). A 400 here usually means the region ID is invalid. Response: ${self.response_body}"
     }
-
-    # An empty family in a live region means a missing key, not empty stock.
-    postcondition {
-      condition     = self.status_code != 200 || length(try(jsondecode(self.response_body).available_plans, [])) > 0
-      error_message = "Vultr reported zero available ${each.key} plans in region \"${var.region}\". This endpoint returns an empty list rather than a 401 when the API key is missing or invalid, so check vultr_api_key before believing the region is out of stock."
-    }
   }
 }
 
@@ -60,6 +57,14 @@ resource "terraform_data" "cloud_plan_availability_check" {
   count = var.verify_plan_availability ? 1 : 0
 
   lifecycle {
+    # Every cloud family empty at once in a live region means a missing key,
+    # not empty stock. Checked first so the plan-specific messages below are
+    # not mistaken for real stock answers.
+    precondition {
+      condition     = length(local.cloud_available_plans) > 0
+      error_message = "Vultr reported zero available plans across every cloud family (${join(", ", local.cloud_plan_types)}) in region \"${var.region}\". This endpoint returns an empty list rather than a 401 when the API key is missing or invalid, so check vultr_api_key before believing the region is out of stock."
+    }
+
     precondition {
       condition     = contains(local.cloud_available_plans, var.control_plane_plan)
       error_message = "Control-plane plan \"${var.control_plane_plan}\" is not currently available (checked ${join(", ", local.cloud_plan_types)}) in region \"${var.region}\". Available: ${join(", ", local.cloud_available_plans)}"
@@ -95,7 +100,9 @@ locals {
 # GPU pools, both families, flattened to one pool -> {plan, type} map so the
 # availability check is written once. The type is the query parameter the
 # endpoint scopes its answer to: "vbm" for bare metal, and for cloud whatever
-# the pool declared or the rule above inferred.
+# the pool declared or the rule above inferred. count = 0 pools are left out:
+# they create nothing, and parking a pool at 0 while its plan is out of stock
+# is exactly what count = 0 is for. Scaling one up re-enables its check.
 locals {
   gpu_pool_plans = merge(
     {
@@ -103,19 +110,19 @@ locals {
         plan   = p.plan
         type   = "vbm"
         family = "bare metal"
-      }
+      } if p.count > 0
     },
     {
       for k, p in var.gpu_cloud_pools : k => {
         plan   = p.plan
         type   = local.gpu_cloud_plan_types[k]
         family = "cloud"
-      }
+      } if p.count > 0
     },
   )
 
-  # Only the types actually in use are queried; with no GPU pools at all this
-  # is empty and the whole check disappears.
+  # Only the types actually in use are queried; with no non-empty GPU pools
+  # this is empty and the whole check disappears.
   gpu_plan_types = toset([for p in values(local.gpu_pool_plans) : p.type])
 }
 
