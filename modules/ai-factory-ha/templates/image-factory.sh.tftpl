@@ -39,6 +39,10 @@ trap cleanup EXIT
 log "=== image-factory starting ==="
 
 log "step 1/9: refreshing repos and installing podman, python3, curl"
+# Leap 16's zypper fetches packages up front through a parallel "Preloading"
+# downloader, which 404s on every package via cdn.opensuse.org (MirrorCache)
+# while the same packages download fine the classic way. Seen 2026-09-24.
+export ZYPP_PCK_PRELOAD=0
 zypper -n --gpg-auto-import-keys refresh \
   || log "zypper refresh reported a non-zero exit, continuing"
 # python3, not python3-base: the base-vs-full split of http.server/json has
@@ -46,6 +50,14 @@ zypper -n --gpg-auto-import-keys refresh \
 # is installed unconditionally, so that path can't fail on a missing module.
 zypper -n install podman python3 python3-PyYAML curl \
   || log "zypper install reported a non-zero exit (packages may already be present), continuing"
+# The exit code alone can't tell "already installed" from "nothing got
+# installed", so check for what the rest of the script actually needs.
+for cmd in podman python3 curl; do
+  if ! command -v "$cmd" >/dev/null; then
+    log "ERROR: $cmd is not installed after zypper install -- see the zypper output above"
+    exit 1
+  fi
+done
 
 log "step 2/9: enabling podman.socket"
 systemctl enable --now podman.socket
