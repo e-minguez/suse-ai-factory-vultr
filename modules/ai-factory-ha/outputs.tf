@@ -54,7 +54,7 @@ output "vpc_subnet" {
 }
 
 output "snapshot_id" {
-  description = "The Vultr snapshot the cluster was (or will be) provisioned from -- either the jumphost-built one or var.snapshot_id if that override was set."
+  description = "The Vultr snapshot the cluster was (or will be) provisioned from -- either the one this module imported (vultr_snapshot_from_url) or var.snapshot_id if that override was set."
   value       = local.effective_snapshot_id
 }
 

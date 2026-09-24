@@ -784,9 +784,9 @@ locals {
 # gets you:
 #
 #   Cycle: time_static.build -> local.elemental_files -> <the merged map>
-#          -> local.factory_script_documented -> local.snapshot_description
+#          -> local.factory_script_documented -> local.image_file
 #
-# image-factory.sh interpolates snapshot_description, which is derived from
+# image-factory.sh interpolates image_file (and serve_path), both derived from
 # time_static.build, whose `config` trigger is the sha256 of elemental_files.
 # Merging the two puts elemental_files downstream of the factory script and
 # closes the loop. Keeping them as two expressions over shared regex locals

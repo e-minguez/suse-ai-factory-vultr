@@ -32,13 +32,10 @@ resource "vultr_load_balancer" "api" {
   # sort() is not cosmetic. attached_instances is an ORDERED list to the
   # provider, and Vultr returns it sorted, while deploy.sh writes it in
   # control-plane index order -- so an unsorted value is a diff that never
-  # converges. That matters far beyond tidiness: a pending change on this
-  # resource is enough to defer data.vultr_snapshot.ai_factory's read to apply
-  # time (it depends on the jumphost, whose user_data embeds this LB's ipv4),
-  # which makes local.effective_snapshot_id unknown at plan, which is ForceNew
-  # on every node. A permanent no-op diff here therefore means every bare
-  # `terraform plan` proposes destroying the cluster. Sorting both sides makes
-  # the diff disappear and disarms that.
+  # converges. A permanent no-op diff on every plan hides real ones, and
+  # back when the snapshot was a depends_on data source it deferred that read
+  # and proposed replacing every node. Sorting both sides makes the diff
+  # disappear.
   attached_instances = sort(var.lb_backend_instance_ids)
 
   forwarding_rules {

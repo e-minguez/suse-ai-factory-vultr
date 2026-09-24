@@ -7,16 +7,12 @@ region = "ams"
 # elemental_image = "registry.opensuse.org/devel/unifiedcore/tumbleweed/containers/elemental:latest"
 
 # --------------------------------------------------------------------------
-# The vultr provider reads VULTR_API_KEY from the environment — do not set
-# it here. This variable is a SEPARATE key, handed to the jumphost so its
-# image-factory script can call the Vultr API (create-from-url, poll the
-# snapshot). It ends up in the jumphost's cloud-init user_data, which is
-# retrievable via `GET /v2/instances/{id}/user-data` for as long as the
-# jumphost exists. Use a key scoped with Vultr's IP allowlist restricted to
-# the jumphost's address, and revoke it once the snapshot has been built —
-# it is not needed again after that.
+# The vultr provider reads VULTR_API_KEY from the environment. This variable
+# is only for the module's plan-time stock checks (availability.tf), which
+# call the API through the http provider; it never leaves your machine, so
+# the same value as VULTR_API_KEY is fine.
 # --------------------------------------------------------------------------
-vultr_api_key = "REPLACE_WITH_A_SCOPED_API_KEY"
+vultr_api_key = "REPLACE_WITH_YOUR_API_KEY"
 
 # CIDRs allowed to SSH into the jumphost. Your admin IP(s)/VPN range, not 0.0.0.0/0.
 admin_cidrs = ["REPLACE_WITH_YOUR_IP/32"]

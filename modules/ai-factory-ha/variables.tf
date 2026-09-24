@@ -12,7 +12,7 @@ variable "elemental_image" {
 variable "vultr_api_key" {
   type        = string
   sensitive   = true
-  description = "Vultr API key, handed to the jumphost's image-factory script so it can call create-from-url and poll the snapshot import. The provider reads its own key from the environment (VULTR_API_KEY); Terraform has no way to read an env var into a variable default, so this has to be supplied explicitly."
+  description = "Vultr API key for availability.tf's plan-time stock checks, which call the API through the http provider rather than the vultr one. The provider reads its own key from the environment (VULTR_API_KEY); Terraform has no way to read an env var into a variable default, so this has to be supplied explicitly. Never sent to the jumphost."
 }
 
 variable "admin_cidrs" {
@@ -674,13 +674,13 @@ variable "fips" {
 variable "snapshot_id" {
   type        = string
   default     = null
-  description = "Override: use an already-imported Vultr snapshot instead of building one. When set, the jumphost-driven build/wait/lookup all drop to count = 0 (see snapshot.tf), which is how a redeploy reuses an image already built."
+  description = "Override: provision the nodes from a snapshot built outside this module instead of the one it imports (see snapshot.tf). Setting it drops vultr_snapshot_from_url.ai_factory to count = 0, which DESTROYS a snapshot this module already built -- the managed one needs no pinning, its id is known from state."
 }
 
 variable "deploy_nodes" {
   type        = bool
   default     = true
-  description = "Whether to provision the control-plane and GPU nodes (and, by extension, wait for the snapshot). false stands up only the network, load balancer and jumphost/image factory on their own."
+  description = "Whether to provision the control-plane and GPU nodes. false stands up only the network, load balancer and jumphost/image factory -- which still builds and imports the snapshot, so the apply still blocks on it."
 }
 
 variable "lb_backend_instance_ids" {
@@ -698,7 +698,24 @@ variable "lb_supervisor_extra_cidrs" {
 variable "image_build_timeout" {
   type        = number
   default     = 5400
-  description = "Seconds the snapshot-wait local-exec (scripts/wait-for-snapshot.sh) will poll the Vultr API before giving up. 5400 (90 min) gives headroom over a cold podman pull of the elemental image plus the raw build plus the snapshot import."
+  description = "Seconds scripts/wait-for-image.sh will poll the jumphost for the served raw before giving up. 5400 (90 min) gives headroom over a cold podman pull of the elemental image plus the raw build."
+}
+
+variable "image_serve_seconds" {
+  type        = number
+  default     = 3600
+  description = "Seconds the jumphost serves the raw after building it, then stops the http server and deletes the file. A fixed window because knowing when the import finished would need a Vultr API key on the jumphost. Also the timeout for scripts/wait-for-snapshot.sh, since an import still pending once serving stops will not complete."
+
+  validation {
+    condition     = var.image_serve_seconds >= 600
+    error_message = "image_serve_seconds must be at least 600: Vultr's fetch of a multi-GB raw takes minutes, and wait-for-snapshot.sh shares this as its timeout."
+  }
+}
+
+variable "image_import_port_open" {
+  type        = bool
+  default     = true
+  description = "Whether the jumphost's firewall group allows tcp/80 from 0.0.0.0/0 for Vultr's create-from-url fetcher (snapshot.tf). A Terraform resource, so it cannot be opened and closed within one apply: examples/ha-cluster/deploy.sh leaves it at the default on pass 1 and sets it false on pass 2, after the snapshot is complete. A rebuild with it false fails in wait-for-image.sh."
 }
 
 variable "verify_plan_availability" {

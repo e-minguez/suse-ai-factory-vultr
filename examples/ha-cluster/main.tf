@@ -69,6 +69,8 @@ module "ha_cluster" {
   gpu_cloud_extra_cidrs     = var.gpu_cloud_extra_cidrs
 
   image_build_timeout      = var.image_build_timeout
+  image_serve_seconds      = var.image_serve_seconds
+  image_import_port_open   = var.image_import_port_open
   verify_plan_availability = var.verify_plan_availability
 
   ssh_key_ids      = var.ssh_key_ids

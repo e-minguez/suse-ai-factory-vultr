@@ -1,17 +1,25 @@
-# Handoff between "the jumphost built an image" and "Terraform has a snapshot
-# ID": both sides agree on one description string, derived here and passed to
-# the build script (jumphost.tf's factory_script), so neither can drift.
+# The jumphost builds and serves the raw image; Terraform imports it with
+# vultr_snapshot_from_url, so the snapshot lives in state and `terraform
+# destroy` removes it. The jumphost never holds a Vultr API key.
 #
-# A timestamp, not a random id, so `vultr-cli snapshot list` sorts as a build
-# history -- orphans accumulate, since destroy never removes them.
+# Order within one apply:
+#   jumphost boots, builds, serves   (templates/image-factory.sh.tftpl)
+#   terraform_data.image_served      polls the URL from the operator's machine
+#   vultr_snapshot_from_url          create-from-url, then waits for "complete"
+#   nodes                            provisioned from it
+#
+# time_static is the build identity: every trigger below rotates
+# random_id.serve_path (jumphost.tf), which replaces the jumphost and the
+# snapshot together. A timestamp, not a random id, so the served file name
+# reads as a build history in the jumphost's log.
 #
 # time_static, not timestamp(): timestamp() re-evaluates every plan, drifting
-# the description and with it the jumphost's ForceNew user_data.
+# the file name and with it the jumphost's ForceNew user_data.
 resource "time_static" "build" {
   triggers = {
     # Hash the RENDERED config, not the *.tftpl sources: a change to a
-    # variable alone would leave a source hash untouched, so the wait would
-    # be skipped and nodes provisioned from the previous build's snapshot.
+    # variable alone would leave a source hash untouched, so no rebuild would
+    # happen and nodes would come up from the previous build's snapshot.
     cluster  = var.cluster_name
     endpoint = vultr_load_balancer.api.ipv4
     image    = var.elemental_image # not part of elemental_files; only reaches factory_script
@@ -38,61 +46,96 @@ resource "time_static" "build" {
 }
 
 locals {
-  # e.g. "suse-ai-factory-20260914-143512", UTC -- time_static records a "Z"
-  # instant and formatdate does no conversion, so it compares directly against
-  # Vultr's own date_created.
-  snapshot_description = "${var.cluster_name}-${formatdate("YYYYMMDD-hhmmss", time_static.build.rfc3339)}"
+  # e.g. "suse-ai-factory-20260914-143512.raw", UTC -- time_static records a
+  # "Z" instant and formatdate does no conversion.
+  image_file = "${var.cluster_name}-${formatdate("YYYYMMDD-hhmmss", time_static.build.rfc3339)}.raw"
+  image_url  = "http://${vultr_instance.jumphost.main_ip}/${random_id.serve_path.hex}/${local.image_file}"
 }
 
-# Blocks the apply until the snapshot is complete, or image_build_timeout
-# runs out. count = 0 when snapshot_id overrides the build or deploy_nodes is
-# false -- nothing is waiting on the image.
-resource "terraform_data" "snapshot_ready" {
-  count = var.snapshot_id == null && var.deploy_nodes ? 1 : 0
+# Port 80 for Vultr's create-from-url fetcher. A resource, not an API call
+# from the jumphost, so no key has to live there -- which means it cannot be
+# created and removed within one apply. deploy.sh's pass 2 sets
+# image_import_port_open = false once the snapshot is complete, and resets it
+# to the default (true) before every pass 1 so a rebuild finds it open.
+#
+# Created alongside the jumphost, not after the build: the cloud firewall is a
+# distributed filter, and a rule created seconds before create-from-url is not
+# necessarily in force at the edge the fetcher arrives through. The build buys
+# it propagation time for free.
+resource "vultr_firewall_rule" "image_import" {
+  count = var.image_import_port_open ? 1 : 0
 
-  depends_on = [vultr_instance.jumphost]
+  firewall_group_id = vultr_firewall_group.jumphost.id
+  protocol          = "tcp"
+  ip_type           = "v4"
+  subnet            = "0.0.0.0"
+  subnet_size       = 0
+  port              = "80"
+  notes             = "elemental image import"
+}
 
-  # triggers_replace, not just `input`: local-exec fires only on create, and
-  # a changed `input` updates in place. Without this a rebuild would skip the
-  # wait and read a snapshot that does not exist yet.
-  triggers_replace = [local.snapshot_description]
-  input            = local.snapshot_description
+# Blocks until the jumphost answers for the raw, or image_build_timeout runs
+# out. Polled from OUTSIDE, over the same public path Vultr's fetcher takes,
+# so a firewall rule that has not propagated yet shows up here as "not yet"
+# instead of as a create-from-url that Vultr silently drops.
+#
+# triggers_replace keys off the build, not the URL: a jumphost replaced for an
+# unrelated reason (a new jumphost_username, say) gets a new IP without
+# anything needing a new image.
+resource "terraform_data" "image_served" {
+  count = var.snapshot_id == null ? 1 : 0
+
+  depends_on = [vultr_firewall_rule.image_import]
+
+  triggers_replace = [random_id.serve_path.hex]
+  input            = local.image_url
 
   provisioner "local-exec" {
-    command = "${path.module}/scripts/wait-for-snapshot.sh"
+    command = "${path.module}/scripts/wait-for-image.sh"
     environment = {
-      SNAPSHOT_DESCRIPTION = local.snapshot_description
-      TIMEOUT_SECONDS      = var.image_build_timeout
-      POLL_SECONDS         = 30
+      IMAGE_URL       = local.image_url
+      TIMEOUT_SECONDS = var.image_build_timeout
+      POLL_SECONDS    = 30
     }
   }
 }
 
-# depends_on is load-bearing: it defers the read to apply time. Without it
-# Terraform reads during plan, before the image exists, and fails.
-data "vultr_snapshot" "ai_factory" {
-  count = var.snapshot_id == null && var.deploy_nodes ? 1 : 0
+# One attempt. Vultr DELETES the record when its fetch fails, and the
+# provider's read then errors on the 404 instead of dropping it from state --
+# so a failed import needs a `terraform state rm` of this resource before the
+# next apply (see the README's Known gaps).
+#
+# ignore_changes + replace_triggered_by: url embeds the jumphost's IP and is
+# ForceNew, so without this any jumphost replacement would replace the
+# snapshot and, through snapshot_id, every node. Only a new build should.
+resource "vultr_snapshot_from_url" "ai_factory" {
+  count = var.snapshot_id == null ? 1 : 0
 
-  depends_on = [terraform_data.snapshot_ready]
+  depends_on = [terraform_data.image_served]
 
-  filter {
-    name   = "description"
-    values = [local.snapshot_description]
-  }
+  url      = local.image_url
+  use_uefi = true
 
   lifecycle {
-    postcondition {
-      # The provider already errors on 0 or >1 matches; this only catches a
-      # match in a non-terminal state.
-      condition     = self.status == "complete"
-      error_message = "Snapshot ${local.snapshot_description} is \"${self.status}\", not \"complete\"."
+    ignore_changes       = [url]
+    replace_triggered_by = [random_id.serve_path]
+  }
+
+  # The provider returns as soon as Vultr accepts the request, with status
+  # still "pending"; nodes built from that would fail. This holds creation
+  # until "complete", and a failure taints the resource.
+  provisioner "local-exec" {
+    command = "${path.module}/scripts/wait-for-snapshot.sh"
+    environment = {
+      SNAPSHOT_ID     = self.id
+      TIMEOUT_SECONDS = var.image_serve_seconds
+      POLL_SECONDS    = 30
     }
   }
 }
 
 locals {
-  # Not a coalesce(): with deploy_nodes = false both branches are null, and
-  # coalesce() errors on all-null rather than returning null. Null is the
-  # correct answer there -- nothing has asked for a snapshot.
-  effective_snapshot_id = var.snapshot_id != null ? var.snapshot_id : try(data.vultr_snapshot.ai_factory[0].id, null)
+  # one(), not [0]: with snapshot_id set the build resource has count = 0 and
+  # indexing it would be an error even in the untaken branch.
+  effective_snapshot_id = var.snapshot_id != null ? var.snapshot_id : one(vultr_snapshot_from_url.ai_factory[*].id)
 }
