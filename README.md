@@ -24,6 +24,31 @@ image can actually use — bare metal boot modes, why the fractional Cloud GPU
 plans are unusable and the whole-node ones are not, and two bare metal API
 limits worth knowing before you plan a deployment.
 
+## Known limitation: no NVIDIA driver for SLES 16.1 yet (as of 2026-09-23)
+
+GPU nodes, bare metal and cloud alike, provision and join the cluster, but the
+GPU operator cannot install a driver on them, so they expose no
+`nvidia.com/gpu` capacity and GPU workloads do not schedule.
+
+The nodes run SLES 16.1 (kernel `6.12.0-160100.x`), which the module needs:
+`core_platform_override` pins the 16.1 OS image because the 16.0 one does not
+bring up Kubernetes (see
+[the module README](modules/ai-factory-ha/README.md#core_platform_override-why-the-os-image-has-to-be-pinned-by-hand)).
+The precompiled driver images at
+[`registry.suse.com/third-party/nvidia/driver`](https://registry.suse.com/repositories/third-party-nvidia-driver-sles16)
+are published for SLES 16.0 only, so the driver pod fails with
+`ImagePullBackOff` on a tag such as `610-6.12.0-160100.5-default-sles16.1`.
+
+A 16.0 image cannot stand in for it. Loading a 16.0 module on a 16.1 node fails
+with `nvidia: disagrees about version of symbol module_layout`: the kernel's
+module ABI changed between the two, so retagging or pinning an older driver
+branch does not help.
+
+This resolves once SLES 16.1 driver images are published; no change to the
+module should be needed. Until then, the options are building the driver
+container for the 16.1 kernel yourself, or leaving `gpu-operator` out of
+`components`.
+
 ## Usage
 
 ```bash
