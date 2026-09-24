@@ -66,12 +66,14 @@ variable "permit_root_ssh" {
 
 variable "appco_username" {
   type        = string
+  default     = null
   sensitive   = true
-  description = "SUSE Application Collection username."
+  description = "SUSE Application Collection username. Required when components lists local-path-provisioner or suse-storage (the module fails the plan otherwise); optional but highly recommended for aif-operator."
 }
 
 variable "appco_password" {
   type        = string
+  default     = null
   sensitive   = true
   description = "SUSE Application Collection password/token, paired with appco_username."
 }
@@ -84,12 +86,14 @@ variable "appco_registry" {
 
 variable "suse_registration_code" {
   type        = string
+  default     = null
   sensitive   = true
-  description = "SUSE registration code -- used as the \"username\" for aif-operator.yaml's suseRegistry credentials, per SUSE's own convention."
+  description = "SUSE registration code -- used as the \"username\" for aif-operator.yaml's suseRegistry credentials, per SUSE's own convention. Optional but highly recommended: when null, the suseRegistry block is omitted."
 }
 
 variable "suse_registry_password" {
   type        = string
+  default     = null
   sensitive   = true
   description = "Password paired with suse_registration_code."
 }
@@ -98,7 +102,13 @@ variable "nvidia_api_key" {
   type        = string
   default     = null
   sensitive   = true
-  description = "NVIDIA NGC API key. Optional: when null, aif-operator.yaml's nvidia: credentials block is omitted entirely. The paired username, when present, is always \"$oauthtoken\" -- NGC's convention, hardcoded in the module."
+  description = "NVIDIA NGC API key. Optional but highly recommended: when null, aif-operator.yaml's nvidia: credentials block is omitted entirely. The paired username is nvidia_username."
+}
+
+variable "nvidia_username" {
+  type        = string
+  default     = "$oauthtoken"
+  description = "Username paired with nvidia_api_key. Defaults to \"$oauthtoken\", NGC's convention for API-key auth; override only if needed."
 }
 
 variable "components" {

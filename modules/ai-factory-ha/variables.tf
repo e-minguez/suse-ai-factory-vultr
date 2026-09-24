@@ -87,14 +87,34 @@ variable "permit_root_ssh" {
 
 variable "appco_username" {
   type        = string
+  default     = null
   sensitive   = true
-  description = "SUSE Application Collection username. Used to authenticate the local-path-provisioner Helm chart pull (release.yaml) and the image pull secret in kubernetes/manifests/local-path-provisioner.yaml, and written into kubernetes/helm/values/aif-operator.yaml's credentials.applicationCollection.username."
+  description = "SUSE Application Collection username. Used to authenticate the local-path-provisioner / suse-storage Helm chart pulls (release.yaml) and their image pulls (kubernetes/manifests/local-path-provisioner.yaml's pull secret, suse-storage.yaml's privateRegistry), and written into kubernetes/helm/values/aif-operator.yaml's credentials.applicationCollection.username. Optional in the type, NOT in practice: required (validated at plan time) whenever components lists local-path-provisioner or suse-storage, since both are pulled from Application Collection and would otherwise sit in ImagePullBackOff with no StorageClass. When null, aif-operator.yaml omits the applicationCollection block. An empty string counts as unset."
+
+  validation {
+    # Both storage charts and their images live behind Application Collection
+    # auth. Without credentials the image still builds and boots, and the
+    # failure only shows up post-install as an ImagePullBackOff -- fail here
+    # instead, before anything is created. try(): trimspace(null) errors, and
+    # && does not short-circuit.
+    condition = (
+      !(contains(var.components, "local-path-provisioner") || contains(var.components, "suse-storage"))
+      || try(trimspace(var.appco_username) != "" && trimspace(var.appco_password) != "", false)
+    )
+    error_message = "components lists local-path-provisioner or suse-storage, which are pulled from SUSE Application Collection and need appco_username and appco_password. Set both, or drop the storage chart from components."
+  }
+
+  validation {
+    condition     = try(trimspace(var.appco_username) != "", false) == try(trimspace(var.appco_password) != "", false)
+    error_message = "appco_username and appco_password must be set together -- one without the other is never usable."
+  }
 }
 
 variable "appco_password" {
   type        = string
+  default     = null
   sensitive   = true
-  description = "SUSE Application Collection password/token, paired with appco_username."
+  description = "SUSE Application Collection password/token, paired with appco_username. See appco_username for when it is required."
 }
 
 variable "appco_registry" {
@@ -105,12 +125,19 @@ variable "appco_registry" {
 
 variable "suse_registration_code" {
   type        = string
+  default     = null
   sensitive   = true
-  description = "SUSE registration code, written as kubernetes/helm/values/aif-operator.yaml's credentials.suseRegistry.username -- per SUSE's own convention, the registry \"username\" for this registry is always the registration code itself."
+  description = "SUSE registration code, written as kubernetes/helm/values/aif-operator.yaml's credentials.suseRegistry.username -- per SUSE's own convention, the registry \"username\" for this registry is always the registration code itself. Optional but highly recommended: when null, aif-operator.yaml omits the suseRegistry block and aif-operator runs without SUSE registry credentials. An empty string counts as unset."
+
+  validation {
+    condition     = try(trimspace(var.suse_registration_code) != "", false) == try(trimspace(var.suse_registry_password) != "", false)
+    error_message = "suse_registration_code and suse_registry_password must be set together -- one without the other is never usable."
+  }
 }
 
 variable "suse_registry_password" {
   type        = string
+  default     = null
   sensitive   = true
   description = "Password paired with suse_registration_code for the SUSE registry, written into aif-operator.yaml's credentials.suseRegistry.password."
 }
@@ -119,7 +146,18 @@ variable "nvidia_api_key" {
   type        = string
   default     = null
   sensitive   = true
-  description = "NVIDIA NGC API key, written into aif-operator.yaml's credentials.nvidia.password. Optional: when null, the whole nvidia: credentials block is omitted from aif-operator.yaml rather than written with an empty password. The paired username, when the block is present, is always the literal string \"$oauthtoken\" -- NGC's own convention, not a secret -- so it is hardcoded in the template rather than exposed as a variable."
+  description = "NVIDIA NGC API key, written into aif-operator.yaml's credentials.nvidia.password. Optional but highly recommended: when null (or an empty string), the whole nvidia: credentials block is omitted from aif-operator.yaml rather than written with an empty password. The paired username is nvidia_username."
+}
+
+variable "nvidia_username" {
+  type        = string
+  default     = "$oauthtoken"
+  description = "Username written into aif-operator.yaml's credentials.nvidia.username alongside nvidia_api_key. Defaults to the literal string \"$oauthtoken\" -- NGC's own convention for API-key auth, not a secret. Override only if your NGC setup expects something else. Ignored when nvidia_api_key is unset."
+
+  validation {
+    condition     = trimspace(var.nvidia_username) != ""
+    error_message = "nvidia_username must not be empty; leave it at its \"$oauthtoken\" default unless you know otherwise."
+  }
 }
 
 variable "components" {

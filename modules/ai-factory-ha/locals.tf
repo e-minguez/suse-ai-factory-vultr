@@ -63,12 +63,26 @@ data "http" "aif_release_manifest" {
   }
 }
 
+# Which optional credential sets were actually supplied. "" counts as unset,
+# same as null; try() because trimspace(null) errors. nonsensitive(): whether a
+# credential is set is not itself a secret, and keeping these plain lets the
+# templates branch on them. variables.tf validates the pairs are set together
+# and that appco is present whenever a storage chart needs it.
+locals {
+  appco_credentials_set         = nonsensitive(try(trimspace(var.appco_username) != "" && trimspace(var.appco_password) != "", false))
+  suse_registry_credentials_set = nonsensitive(try(trimspace(var.suse_registration_code) != "" && trimspace(var.suse_registry_password) != "", false))
+  nvidia_credentials_set        = nonsensitive(try(trimspace(var.nvidia_api_key) != "", false))
+}
+
 # local-path-provisioner's imagePullSecrets expect a Secret named
 # "application-collection"; kubernetes/manifests/local-path-provisioner.yaml
 # below creates it. A dockerconfigjson Secret is just base64(json(...)), so
-# Terraform computes it rather than a template hand-rolling it.
+# Terraform computes it rather than a template hand-rolling it. null without
+# appco credentials -- "${null}" is an error -- which is safe because the only
+# consumer is local-path-provisioner, and variables.tf refuses that chart
+# without them.
 locals {
-  dockerconfigjson_b64 = base64encode(jsonencode({
+  dockerconfigjson_b64 = !local.appco_credentials_set ? null : base64encode(jsonencode({
     auths = {
       (var.appco_registry) = {
         username = var.appco_username
@@ -601,6 +615,10 @@ locals {
         suse_registration_code = var.suse_registration_code
         suse_registry_password = var.suse_registry_password
         nvidia_api_key         = var.nvidia_api_key
+        nvidia_username        = var.nvidia_username
+        appco_set              = local.appco_credentials_set
+        suse_registry_set      = local.suse_registry_credentials_set
+        nvidia_set             = local.nvidia_credentials_set
       })
     },
   )

@@ -767,21 +767,28 @@ the default derivation that trigger is inert — a tag does not move — and it
 earns its keep only when `aif_release_manifest_url` points at a branch; see
 [above](#suse-ai-factory-version).
 
-local-path-provisioner's chart pulls from an authenticated Application
-Collection repository, so `release.yaml` carries `appco_username`/
-`appco_password` credentials for it, and
+local-path-provisioner's and suse-storage's charts pull from an
+authenticated Application Collection repository, so `release.yaml` carries
+`appco_username`/`appco_password` credentials for them — which is why those
+two variables, though they default to `null`, are validated as **required**
+whenever either storage chart is in `components`: the plan fails up front
+instead of the cluster coming up with a provisioner stuck in
+`ImagePullBackOff` and no working StorageClass. For
+local-path-provisioner,
 `kubernetes/manifests/local-path-provisioner.yaml` creates the matching
 `application-collection` image pull secret the chart's own values expect
 (Terraform computes the `dockerconfigjson`, not a manifest placeholder).
-`aif-operator.yaml` needs two required credential pairs and one optional
-one: the same Application Collection ones, a SUSE registration code
+`aif-operator.yaml` takes three credential sets, all optional but highly
+recommended: the same Application Collection ones, a SUSE registration code
 (`suse_registration_code` — per SUSE's convention, the registry "username"
-for that registry is the regcode itself) with `suse_registry_password`,
-and an *optional* NVIDIA NGC API key (`nvidia_api_key`, default `null`;
-NGC's username is always the literal `$oauthtoken`, so it isn't a
-variable). When `nvidia_api_key` is `null`, the whole `nvidia:` credentials
-block is omitted from `aif-operator.yaml` rather than written with an empty
-password. `rancher.yaml` gets a hostname and bootstrap password that the
+for that registry is the regcode itself) with `suse_registry_password`, and
+an NVIDIA NGC API key (`nvidia_api_key`, paired with `nvidia_username`,
+which defaults to NGC's literal `$oauthtoken` convention). Each set left `null` (or
+`""`) is omitted from `aif-operator.yaml`'s `credentials:` block rather than
+written with empty values, and each username/password pair is validated to
+be set together or not at all. In practice the appco pair is always present
+with aif-operator, since aif-operator requires a storage chart and both
+storage charts require it. `rancher.yaml` gets a hostname and bootstrap password that the
 manifest doesn't otherwise set — see `rancher_hostname` and
 `rancher_bootstrap_password`.
 
@@ -797,8 +804,6 @@ Required, no default:
 | `root_password_hash` | `string`, sensitive | goes into the image's `butane.yaml`; without it there is no console login on any node, and no password for `su -` |
 | `node_user_password_hash` | `string`, sensitive | the unprivileged account's own password, validated to differ from `root_password_hash` — otherwise the split buys nothing |
 | `ssh_authorized_keys` | `list(string)` | without at least one key, nothing has a way in over SSH at all — see below |
-| `appco_username`, `appco_password` | `string`, sensitive | SUSE Application Collection credentials; no sane default for a credential |
-| `suse_registration_code`, `suse_registry_password` | `string`, sensitive | SUSE registry credentials; same reasoning |
 
 Everything else has a default — see `variables.tf` for the full list and the
 reasoning behind each one. Notable ones:
@@ -825,7 +830,10 @@ reasoning behind each one. Notable ones:
 | `rancher_hostname` | `null` | defaults to `"rancher-<ingress_lb_ipv4>.sslip.io"` (computed in `locals.tf`) when null — the ingress load balancer, not the API one |
 | `rancher_bootstrap_password` | `null` | defaults to a generated `random_password` when null — see `outputs.rancher_bootstrap_password` |
 | `appco_registry` | `"dp.apps.rancher.io"` | best-evidence guess at the container registry host behind Application Collection's only documented OCI endpoint; override if wrong |
-| `nvidia_api_key` | `null` | optional; when unset, `aif-operator.yaml`'s `nvidia:` credentials block is omitted entirely |
+| `appco_username`, `appco_password` | `null` | **required** (plan-time validation) when `components` lists `local-path-provisioner` or `suse-storage`; otherwise optional. When unset, `aif-operator.yaml`'s `applicationCollection:` block is omitted |
+| `suse_registration_code`, `suse_registry_password` | `null` | optional but highly recommended; when unset, `aif-operator.yaml`'s `suseRegistry:` block is omitted |
+| `nvidia_api_key` | `null` | optional but highly recommended; when unset, `aif-operator.yaml`'s `nvidia:` credentials block is omitted entirely |
+| `nvidia_username` | `"$oauthtoken"` | NGC's convention for API-key auth; override only if your NGC setup expects something else |
 | `aif_version` | `"2.2.0"` | which AI Factory release manifest to build against. Becomes SUSE/aif's `aif-operator-<version>` tag, so it must be a full `X.Y.Z` (no `"2.2"`), optionally with a pre-release suffix (`"2.3.0-dev.2"`); `2.1.0` is the floor, since `aif-operator-2.0.x` ships no manifest. A tag, not a branch, because it cannot move under a built cluster — but a `check` block still warns when the manifest's own `metadata.version` disagrees, which upstream does. Selects **charts only** — the OS side is `elemental_image` / `core_platform_override` / `sysext_image_overrides`. See [above](#suse-ai-factory-version). Changing it rebuilds the image and replaces every node |
 | `aif_release_manifest_url` | `null` | override: a full raw URL to a release manifest, for a branch ref, a fork or a mirror. When set, `aif_version` is ignored |
 | `components` | `["rancher", "gpu-operator", "local-path-provisioner", "aif-operator"]` | which AI Factory Helm charts `release.yaml` enables — see [above](#suse-ai-factory-components). Changing it rebuilds the image and replaces every node |

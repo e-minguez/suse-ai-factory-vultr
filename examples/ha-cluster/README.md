@@ -28,12 +28,16 @@ and rationale.
 
   All of these are baked into the image via `butane.yaml`, so **changing any
   one of them rebuilds the image and replaces every node**.
-- SUSE Application Collection credentials (`appco_username`/`appco_password`)
-  and a SUSE registration code + registry password (`suse_registration_code`/
-  `suse_registry_password`) -- the SUSE AI Factory Helm charts (cert-manager,
-  rancher, gpu-operator, local-path-provisioner, aif-operator) need both.
-  An NVIDIA NGC API key (`nvidia_api_key`) is optional; when left unset,
-  `aif-operator.yaml`'s `nvidia:` credentials block is omitted entirely.
+- SUSE Application Collection credentials (`appco_username`/`appco_password`).
+  **Required** whenever `components` lists `local-path-provisioner` or
+  `suse-storage` -- both charts and their images are pulled from Application
+  Collection, so the plan fails up front without them rather than leaving the
+  cluster with a storage provisioner stuck in `ImagePullBackOff`.
+- Optional but highly recommended: a SUSE registration code + registry
+  password (`suse_registration_code`/`suse_registry_password`) and an NVIDIA
+  NGC API key (`nvidia_api_key`), both handed to aif-operator. Whatever is unset
+  is omitted from `aif-operator.yaml`'s `credentials:` block. Each
+  username/password pair must be set together or not at all.
 - At least one admin CIDR for `admin_cidrs` (your IP or VPN range).
 - At least one GPU pool in `gpu_bare_metal_pools` or `gpu_cloud_pools` --
   **both default to `{}`, and every real option is expensive.** See below.

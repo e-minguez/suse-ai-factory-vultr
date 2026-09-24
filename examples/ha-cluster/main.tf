@@ -23,6 +23,7 @@ module "ha_cluster" {
   suse_registration_code     = var.suse_registration_code
   suse_registry_password     = var.suse_registry_password
   nvidia_api_key             = var.nvidia_api_key
+  nvidia_username            = var.nvidia_username
   components                 = var.components
   rancher_hostname           = var.rancher_hostname
   rancher_bootstrap_password = var.rancher_bootstrap_password
