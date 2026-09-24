@@ -1,9 +1,6 @@
 # Only the jumphost has a Vultr firewall group of any real consequence: it is
-# the sole public admin entrypoint. Port 80 is deliberately absent here --
-# the image-factory script opens it for the create-from-url import window and
-# closes it again afterwards (see templates/image-factory.sh.tftpl). That is
-# not drift: vultr_firewall_group does not enumerate its rules, rules are
-# separate resources, and Terraform prunes only rules it created itself.
+# the sole public admin entrypoint. Port 80 for the snapshot import is in
+# snapshot.tf (vultr_firewall_rule.image_import), next to what it serves.
 resource "vultr_firewall_group" "jumphost" {
   description = "${var.cluster_name}-jumphost"
 }

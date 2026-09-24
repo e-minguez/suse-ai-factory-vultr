@@ -12,7 +12,7 @@ variable "elemental_image" {
 variable "vultr_api_key" {
   type        = string
   sensitive   = true
-  description = "Vultr API key, handed to the jumphost's image-factory script so it can call create-from-url and poll the snapshot import. This ends up in the jumphost's cloud-init user_data, retrievable via GET /v2/instances/{id}/user-data until the instance is destroyed. Use a key scoped with Vultr's IP allowlist to the jumphost and revoke it once the snapshot exists. The vultr provider itself reads VULTR_API_KEY from the environment separately."
+  description = "Vultr API key for the module's plan-time stock checks (availability.tf), which go through the http provider. Can be the same value as VULTR_API_KEY, which the vultr provider reads from the environment separately. Never sent to the jumphost."
 }
 
 variable "admin_cidrs" {
@@ -66,12 +66,14 @@ variable "permit_root_ssh" {
 
 variable "appco_username" {
   type        = string
+  default     = null
   sensitive   = true
-  description = "SUSE Application Collection username."
+  description = "SUSE Application Collection username. Required when components lists local-path-provisioner or suse-storage (the module fails the plan otherwise); optional but highly recommended for aif-operator."
 }
 
 variable "appco_password" {
   type        = string
+  default     = null
   sensitive   = true
   description = "SUSE Application Collection password/token, paired with appco_username."
 }
@@ -84,12 +86,14 @@ variable "appco_registry" {
 
 variable "suse_registration_code" {
   type        = string
+  default     = null
   sensitive   = true
-  description = "SUSE registration code -- used as the \"username\" for aif-operator.yaml's suseRegistry credentials, per SUSE's own convention."
+  description = "SUSE registration code -- used as the \"username\" for aif-operator.yaml's suseRegistry credentials, per SUSE's own convention. Optional but highly recommended: when null, the suseRegistry block is omitted."
 }
 
 variable "suse_registry_password" {
   type        = string
+  default     = null
   sensitive   = true
   description = "Password paired with suse_registration_code."
 }
@@ -98,7 +102,13 @@ variable "nvidia_api_key" {
   type        = string
   default     = null
   sensitive   = true
-  description = "NVIDIA NGC API key. Optional: when null, aif-operator.yaml's nvidia: credentials block is omitted entirely. The paired username, when present, is always \"$oauthtoken\" -- NGC's convention, hardcoded in the module."
+  description = "NVIDIA NGC API key. Optional but highly recommended: when null, aif-operator.yaml's nvidia: credentials block is omitted entirely. The paired username is nvidia_username."
+}
+
+variable "nvidia_username" {
+  type        = string
+  default     = "$oauthtoken"
+  description = "Username paired with nvidia_api_key. Defaults to \"$oauthtoken\", NGC's convention for API-key auth; override only if needed."
 }
 
 variable "components" {
@@ -313,13 +323,13 @@ variable "fips" {
 variable "snapshot_id" {
   type        = string
   default     = null
-  description = "Override: use an already-imported Vultr snapshot instead of having the jumphost build one."
+  description = "Override: provision from a snapshot built outside this module. Setting it DESTROYS the snapshot the module imported, if any -- deploy.sh does not pin it any more."
 }
 
 variable "deploy_nodes" {
   type        = bool
   default     = true
-  description = "Whether to provision the control-plane and GPU nodes. false stands up only the network, load balancer and jumphost/image factory."
+  description = "Whether to provision the control-plane and GPU nodes. false stands up only the network, load balancer and jumphost/image factory, which still builds and imports the snapshot."
 }
 
 variable "lb_backend_instance_ids" {
@@ -340,10 +350,22 @@ variable "gpu_cloud_extra_cidrs" {
   description = "Extra CIDRs allowed to reach the cloud GPU nodes' firewall group, meant for the NAT gateway's public /32s. Filled from nat_gateway_public_cidrs on the second pass by deploy.sh, for the same reason as the two above: the value is unknown at plan time."
 }
 
+variable "image_serve_seconds" {
+  type        = number
+  default     = 3600
+  description = "Seconds the jumphost serves the built raw for Vultr's import before shutting the http server down."
+}
+
+variable "image_import_port_open" {
+  type        = bool
+  default     = true
+  description = "Whether tcp/80 is open on the jumphost for the snapshot import. Managed by deploy.sh: default (open) on pass 1, false on pass 2."
+}
+
 variable "image_build_timeout" {
   type        = number
   default     = 5400
-  description = "Seconds the snapshot-wait step will poll the Vultr API before giving up."
+  description = "Seconds Terraform waits for the jumphost to serve the built raw before giving up."
 }
 
 variable "verify_plan_availability" {

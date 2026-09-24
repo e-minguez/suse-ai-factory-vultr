@@ -1,25 +1,32 @@
-# Unguessable path the raw is served from during the create-from-url window.
-# It only has to outlast a Vultr fetch, but no reason to be predictable.
+# Unguessable path the raw is served from during the serve window. It only
+# has to outlast a Vultr fetch, but no reason to be predictable.
+#
+# Rotated per build (time_static.build, snapshot.tf): the hex lands in the
+# factory script, so a new build replaces the jumphost, and it is what
+# vultr_snapshot_from_url's replace_triggered_by keys off.
 resource "random_id" "serve_path" {
   byte_length = 16
+
+  keepers = {
+    build = time_static.build.rfc3339
+  }
 }
 
-# Builds the raw with podman, serves it over HTTP, calls create-from-url and
-# polls the import. A local, not inline in user_data, so cloud-init.yaml.tftpl
-# can gzip+base64 it like the elemental config files.
+# Builds the raw with podman and serves it over HTTP; Terraform does the
+# import (snapshot.tf). A local, not inline in user_data, so
+# cloud-init.yaml.tftpl can gzip+base64 it like the elemental config files.
 #
 # _documented: locals.tf strips the comments out of this and publishes the
 # result as local.factory_script, which is what cloud-init.yaml.tftpl gets.
 # Nothing should read this value directly.
 locals {
   factory_script_documented = templatefile("${path.module}/templates/image-factory.sh.tftpl", {
-    elemental_image      = var.elemental_image
-    config_dir           = local.config_dir
-    snapshot_description = local.snapshot_description
-    serve_path           = random_id.serve_path.hex
-    vultr_api_key        = var.vultr_api_key
-    firewall_group_id    = vultr_firewall_group.jumphost.id
-    log_file             = "/var/log/elemental-factory.log"
+    elemental_image = var.elemental_image
+    config_dir      = local.config_dir
+    image_file      = local.image_file
+    serve_path      = random_id.serve_path.hex
+    serve_seconds   = var.image_serve_seconds
+    log_file        = "/var/log/elemental-factory.log"
     # local, not var: null means "derive it from aif_version" (locals.tf).
     aif_release_manifest_url = local.aif_release_manifest_url
 
@@ -49,7 +56,8 @@ locals {
 
 # openSUSE Leap 16, the jumphost's own OS -- not the elemental snapshot it
 # builds. Needs a public IPv4: admin SSH in, and Vultr's create-from-url
-# fetcher reads the raw off its public side.
+# fetcher reads the raw off its public side (snapshot.tf builds the URL from
+# main_ip).
 #
 # user_data embeds the LB's ipv4 (cluster.yaml's api_vip), which orders the
 # jumphost after the LB without a depends_on -- safe only because the LB no

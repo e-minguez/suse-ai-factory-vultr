@@ -1,8 +1,8 @@
 # vpc_only control-plane nodes, built from the snapshot the jumphost produces.
 #
 # count keys off plan-known variables, never off local.effective_snapshot_id:
-# that comes from a data source with depends_on and so is unknown until apply,
-# even though it feeds this resource's own snapshot_id.
+# on a first build or a rebuild that is unknown until apply, even though it
+# feeds this resource's own snapshot_id.
 resource "vultr_instance" "control_plane" {
   count = var.deploy_nodes ? var.control_plane_count : 0
 

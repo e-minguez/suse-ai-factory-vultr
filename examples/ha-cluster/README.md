@@ -7,8 +7,9 @@ one acting as the Kubernetes API VIP, one fronting the Traefik ingress — and
 any mix of GPU worker pools (bare metal, cloud, or both), all from a single
 (two-pass) `terraform apply`. Uses `modules/ai-factory-ha`.
 
-You do not build or import the elemental snapshot yourself: the jumphost does
-it as part of the apply. See the module's design notes for the full topology
+You do not build or import the elemental snapshot yourself: the jumphost
+builds and serves it, and Terraform imports it as a `vultr_snapshot_from_url`
+it owns — so `terraform destroy` deletes it too. See the module's design notes for the full topology
 and rationale.
 
 ## Prerequisites
@@ -17,9 +18,8 @@ and rationale.
   another variable, which is only legal from 1.9).
 - `VULTR_API_KEY` exported in the environment (read by the `vultr` provider
   and by the module's snapshot-wait script).
-- A second Vultr API key for `vultr_api_key` (see below) — deliberately
-  **not** the same value as `VULTR_API_KEY`, though it can be if you accept
-  the exposure tradeoff described there.
+- `vultr_api_key` in `terraform.tfvars`, for the plan-time stock checks. It
+  stays on your machine, so the same value as `VULTR_API_KEY` is fine.
 - Two different `openssl passwd -6` hashes: `root_password_hash` and
   `node_user_password_hash`. Terraform rejects the plan if they match.
 - At least one public key for `ssh_authorized_keys` -- this is how you get
@@ -28,12 +28,16 @@ and rationale.
 
   All of these are baked into the image via `butane.yaml`, so **changing any
   one of them rebuilds the image and replaces every node**.
-- SUSE Application Collection credentials (`appco_username`/`appco_password`)
-  and a SUSE registration code + registry password (`suse_registration_code`/
-  `suse_registry_password`) -- the SUSE AI Factory Helm charts (cert-manager,
-  rancher, gpu-operator, local-path-provisioner, aif-operator) need both.
-  An NVIDIA NGC API key (`nvidia_api_key`) is optional; when left unset,
-  `aif-operator.yaml`'s `nvidia:` credentials block is omitted entirely.
+- SUSE Application Collection credentials (`appco_username`/`appco_password`).
+  **Required** whenever `components` lists `local-path-provisioner` or
+  `suse-storage` -- both charts and their images are pulled from Application
+  Collection, so the plan fails up front without them rather than leaving the
+  cluster with a storage provisioner stuck in `ImagePullBackOff`.
+- Optional but highly recommended: a SUSE registration code + registry
+  password (`suse_registration_code`/`suse_registry_password`) and an NVIDIA
+  NGC API key (`nvidia_api_key`), both handed to aif-operator. Whatever is unset
+  is omitted from `aif-operator.yaml`'s `credentials:` block. Each
+  username/password pair must be set together or not at all.
 - At least one admin CIDR for `admin_cidrs` (your IP or VPN range).
 - At least one GPU pool in `gpu_bare_metal_pools` or `gpu_cloud_pools` --
   **both default to `{}`, and every real option is expensive.** See below.
@@ -268,10 +272,7 @@ add/replace of just the affected nodes — no image rebuild, and nothing else in
 the cluster is touched. Nothing node-shaped is baked into the image any more:
 each node reads its own VPC address from Vultr's instance metadata at first
 boot instead of looking itself up in a table computed at plan time (see
-`modules/ai-factory-ha/README.md`'s "VPC addresses" section). `deploy.sh`
-still pins the existing `snapshot_id` by default, which is no longer a
-shortcut with a hostname gap to worry about — the image has no per-node
-content left to be missing from.
+`modules/ai-factory-ha/README.md`'s "VPC addresses" section).
 
 #### Bare metal — `gpu_bare_metal_pools`
 
@@ -363,7 +364,9 @@ done
 ```
 
 The module runs this check itself during `plan` (`verify_plan_availability`,
-default `true`) and names the offending pool when a plan is missing.
+default `true`) and names the offending pool when a plan is missing. Pools
+with `count = 0` are skipped, so a pool can be parked at 0 while its plan is
+out of stock.
 
 ### `elemental_image`'s default, and why it isn't the `:3.0` release
 
@@ -419,16 +422,6 @@ dir at "/usr/lib/ignition/base.d"` instead, the override did not take.
 When picking newer tags, remember `crane ls` sorts lexically -- pipe through
 `sort -V` or `16.1-72.40` looks newer than `16.1-72.5`.
 
-### `vultr_api_key` ends up in the jumphost's cloud-init
-
-The jumphost's image-factory script needs Vultr API access to call
-`create-from-url` and poll the snapshot import, so `vultr_api_key` is
-rendered into its `user_data`. That makes it retrievable via
-`GET /v2/instances/{id}/user-data` for as long as the jumphost exists.
-Mitigate by using a key with Vultr's IP allowlist scoped to the jumphost's
-address, and revoke it once the snapshot has been built — the key is not
-needed again after that point.
-
 ## Usage
 
 ```bash
@@ -448,11 +441,12 @@ is forwarded verbatim to both `terraform apply` calls, except an unknown
 `--flag`, which is a hard error so a typo surfaces here rather than as a
 confusing Terraform message.
 
-`./deploy.sh --rebuild` forces a fresh image build. It is only needed when a
-cluster is already standing and its snapshot is still in state, after an edit
-under `templates/elemental/` or to `locals.tf` -- otherwise a plain run would
-pin the existing snapshot and redeploy the old image. From an empty state a
-plain `./deploy.sh` always builds fresh, so `--rebuild` is a no-op there.
+Whether an image is rebuilt is decided by the module's build triggers (an
+edit under `templates/elemental/`, a changed variable that reaches the image,
+the upstream release manifest's content). `./deploy.sh --rebuild` forces one
+regardless — `-replace` on `time_static.build` in pass 1 — which replaces the
+jumphost, the snapshot and every node. The previous snapshot is **deleted**,
+not kept.
 
 ## The two-pass apply, and why
 
@@ -492,11 +486,21 @@ replaced**, so the file gets regenerated with the new IDs/CIDRs.
 Both passes are re-runnable: pass 1's snapshot wait is a no-op once the
 snapshot exists, and pass 2 is a short backend-list update.
 
+Pass 2 also closes port 80. The jumphost's `tcp/80 from 0.0.0.0/0` rule, which
+Vultr's fetcher needs for the import, is a Terraform resource gated by
+`image_import_port_open`; Terraform cannot create and remove it in one apply,
+so pass 1 leaves it open (the default) and pass 2 writes `false`. Every run
+reopens it for the length of pass 1 — with nothing listening unless a rebuild
+is under way, since the jumphost stops serving `image_serve_seconds` (default
+60 min) after its build. A bare `terraform apply` that needs a rebuild after
+pass 2 fails waiting for the image; use `./deploy.sh`.
+
 ### What to expect timing-wise
 
 Pass 1 blocks for **tens of minutes with no console output** while the
 jumphost pulls the elemental container image, runs `customize --type raw`,
-serves the resulting raw over HTTP, and Vultr imports it as a snapshot.
+serves the resulting raw over HTTP, and Terraform has Vultr import it as a
+snapshot and waits for that to complete.
 From another terminal, watch progress with:
 
 ```bash
@@ -607,32 +611,39 @@ is that every image and driver pull goes through the single shared NAT gateway
     "https://api.vultr.com/v2/bare-metals/<id>/vpcs"
   ```
 
-- **"snapshot ... no longer exists (HTTP 404)" a minute into the import.**
-  Vultr's fetcher never reached the jumphost: the snapshot record is deleted
-  when the image cannot be retrieved, so the 404 is the failure, not a bad id.
-  Usually the image is fine and the cloud firewall rule opened at step 3 was
-  not yet in force at the edge the fetcher arrives through. This is
-  **intermittent** rather than a function of how long the rule has been in
-  place — the same ~3 minutes between jumphost creation and import can fail
-  once and connect first time on the next run. `image-factory.sh` retries the
-  import three times, 90 s apart, which is the real remedy. To tell a firewall
-  miss from a bad image:
+- **"snapshot ... no longer exists" from `wait-for-snapshot.sh`, then every
+  plan errors on a 404.** Vultr's fetcher never got the image: Vultr deletes
+  the record when the fetch fails, and the provider then errors on the
+  missing snapshot at every refresh instead of dropping it from state. The
+  import is attempted **once** — there is no retry, by design — so this means
+  re-running. Usually the image is fine and the port-80 rule was not yet in
+  force at the edge the fetcher arrived through; that is intermittent, and
+  `wait-for-image.sh` fetching the URL from your machine first makes it
+  rarer, not impossible. Recover with:
 
   ```sh
-  grep image.raw /var/log/elemental-factory.log | grep -v 127.0.0.1
+  terraform state rm 'module.ha_cluster.vultr_snapshot_from_url.ai_factory[0]'
+  ./deploy.sh            # --rebuild instead if the jumphost has stopped serving
   ```
 
-  Nothing but the request/diagnosis lines → the fetcher never connected. A
-  `GET` from a public address that then stops → look at the image instead; the
-  log records its apparent and on-disk size at step 8.
+  The jumphost stops serving `image_serve_seconds` after its build, so once
+  that window has passed only `--rebuild` has something to import. To tell a
+  firewall miss from a bad image, on the jumphost:
+
+  ```sh
+  grep '\.raw' /var/log/elemental-factory.log | grep -v 127.0.0.1
+  ```
+
+  Only your own address (from `wait-for-image.sh`) → the fetcher never
+  connected. A `GET` from another public address → look at the image instead;
+  the log records its apparent and on-disk size at step 8.
 - **A lone `~ health_check { + path = "/" }` on the API load balancer is
   provider drift, not something you changed.** Vultr returns an *empty* path
   for a `tcp` health check; the provider's schema defaults `path` to `"/"` and
   its read copies the API value into state, so the two never agree and no
   config value converges — omitting `path` gets the same default back. It is
   noise, not danger: an in-place `health_check` update leaves the LB's `ipv4`
-  known, so unlike an `attached_instances` diff it cannot make the snapshot
-  lookup unknown and propose replacing every node. Silenced with
+  known, so it cannot propose replacing anything. Silenced with
   `ignore_changes = [health_check[0].path]` in `network.tf`. The ingress LB is
   an HTTP check and returns its `/ping` normally.
 - **A local-path PVC stays `Pending` and the helper pod logs `mkdir: can't
@@ -761,15 +772,10 @@ is that every image and driver pull goes through the single shared NAT gateway
 terraform destroy
 ```
 
-Three things it does not clean up, all of which bill:
+The snapshot is in state and destroyed with everything else — and so is the
+jumphost's port-80 rule, if pass 2 has not already removed it.
 
-- **Snapshots.** Created out of band by the jumphost's factory script and only
-  *read* by Terraform through a data source, so destroy never touches them.
-  List with `vultr-cli snapshot list`; they are named
-  `<cluster>-YYYYMMDD-hhmmss` (UTC) so the list reads as a build history.
-- **The factory script's port-80 firewall rule.** Its EXIT trap removes the
-  rule it added for the snapshot-import window, but a run that was *killed*
-  leaves it. Check the jumphost's firewall group for a stray
-  `tcp/80 from 0.0.0.0/0`.
+One thing it does not clean up, which bills:
+
 - **Orphan bare metal** from interrupted runs. `vultr-cli bare-metal list`,
   matched against Terraform state.

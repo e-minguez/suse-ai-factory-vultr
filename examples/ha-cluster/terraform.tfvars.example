@@ -7,16 +7,12 @@ region = "ams"
 # elemental_image = "registry.opensuse.org/devel/unifiedcore/tumbleweed/containers/elemental:latest"
 
 # --------------------------------------------------------------------------
-# The vultr provider reads VULTR_API_KEY from the environment — do not set
-# it here. This variable is a SEPARATE key, handed to the jumphost so its
-# image-factory script can call the Vultr API (create-from-url, poll the
-# snapshot). It ends up in the jumphost's cloud-init user_data, which is
-# retrievable via `GET /v2/instances/{id}/user-data` for as long as the
-# jumphost exists. Use a key scoped with Vultr's IP allowlist restricted to
-# the jumphost's address, and revoke it once the snapshot has been built —
-# it is not needed again after that.
+# The vultr provider reads VULTR_API_KEY from the environment. This variable
+# is only for the module's plan-time stock checks (availability.tf), which
+# call the API through the http provider; it never leaves your machine, so
+# the same value as VULTR_API_KEY is fine.
 # --------------------------------------------------------------------------
-vultr_api_key = "REPLACE_WITH_A_SCOPED_API_KEY"
+vultr_api_key = "REPLACE_WITH_YOUR_API_KEY"
 
 # CIDRs allowed to SSH into the jumphost. Your admin IP(s)/VPN range, not 0.0.0.0/0.
 admin_cidrs = ["REPLACE_WITH_YOUR_IP/32"]
@@ -44,16 +40,20 @@ ssh_authorized_keys = ["REPLACE_WITH_YOUR_ssh-ed25519_OR_ssh-rsa_PUBLIC_KEY"]
 # permit_root_ssh = true
 
 # --------------------------------------------------------------------------
-# SUSE AI Factory helm charts (release.yaml / aif-operator.yaml) need two
-# separate sets of registry credentials. Neither has a default.
+# SUSE AI Factory helm charts (release.yaml / aif-operator.yaml) use two
+# separate sets of registry credentials. Both default to null.
 # --------------------------------------------------------------------------
 
-# SUSE Application Collection (local-path-provisioner chart pull + image pull
-# secret, and aif-operator.yaml's credentials.applicationCollection).
+# SUSE Application Collection (local-path-provisioner / suse-storage chart
+# and image pulls, and aif-operator.yaml's credentials.applicationCollection).
+# REQUIRED whenever components lists local-path-provisioner or suse-storage --
+# the plan fails without them. Otherwise optional but highly recommended.
 appco_username = "REPLACE_WITH_YOUR_APPLICATION_COLLECTION_USERNAME"
 appco_password = "REPLACE_WITH_YOUR_APPLICATION_COLLECTION_PASSWORD"
 
 # SUSE registry: the "username" here is always your registration code itself.
+# Optional but highly recommended; when unset, aif-operator.yaml's
+# suseRegistry block is omitted.
 suse_registration_code = "REPLACE_WITH_YOUR_SUSE_REGISTRATION_CODE"
 suse_registry_password = "REPLACE_WITH_YOUR_SUSE_REGISTRY_PASSWORD"
 
@@ -224,10 +224,12 @@ suse_registry_password = "REPLACE_WITH_YOUR_SUSE_REGISTRY_PASSWORD"
 # ingress_controller = "traefik"
 # ingress_cidrs      = ["0.0.0.0/0"]  # who may reach the ingress LB on 80/443
 
-# Optional: NVIDIA NGC API key (username is always "$oauthtoken", hardcoded
-# in the module). When left at its null default, aif-operator.yaml's
-# nvidia: credentials block is omitted entirely.
-# nvidia_api_key = "REPLACE_WITH_YOUR_NVIDIA_NGC_API_KEY"
+# Optional but highly recommended: NVIDIA NGC API key. When left at its null
+# default, aif-operator.yaml's nvidia: credentials block is omitted entirely.
+# nvidia_username defaults to "$oauthtoken" (NGC's convention for API-key
+# auth); override only if needed.
+# nvidia_api_key  = "REPLACE_WITH_YOUR_NVIDIA_NGC_API_KEY"
+# nvidia_username = "$oauthtoken"
 
 # --------------------------------------------------------------------------
 # components -- which SUSE AI Factory Helm charts release.yaml enables.

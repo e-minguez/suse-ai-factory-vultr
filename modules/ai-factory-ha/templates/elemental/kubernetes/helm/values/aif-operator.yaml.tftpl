@@ -1,15 +1,23 @@
+%{ if appco_set || suse_registry_set || nvidia_set ~}
 credentials:
+%{ endif ~}
+%{ if appco_set ~}
   applicationCollection:
     username: "${appco_username}"
     password: "${appco_password}"
+%{ endif ~}
+%{ if suse_registry_set ~}
   suseRegistry:
     # The username for this registry is always the registration code itself.
     username: "${suse_registration_code}"
     password: "${suse_registry_password}"
-%{ if nvidia_api_key != null ~}
+%{ endif ~}
+%{ if nvidia_set ~}
   nvidia:
+%{ if nvidia_username == "$oauthtoken" ~}
     # NGC's own convention: the username is always the literal string
     # "$oauthtoken", never a real account name.
-    username: "$oauthtoken"
+%{ endif ~}
+    username: "${nvidia_username}"
     password: "${nvidia_api_key}"
 %{ endif ~}

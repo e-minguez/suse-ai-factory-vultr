@@ -12,7 +12,7 @@ variable "elemental_image" {
 variable "vultr_api_key" {
   type        = string
   sensitive   = true
-  description = "Vultr API key, handed to the jumphost's image-factory script so it can call create-from-url and poll the snapshot import. The provider reads its own key from the environment (VULTR_API_KEY); Terraform has no way to read an env var into a variable default, so this has to be supplied explicitly."
+  description = "Vultr API key for availability.tf's plan-time stock checks, which call the API through the http provider rather than the vultr one. The provider reads its own key from the environment (VULTR_API_KEY); Terraform has no way to read an env var into a variable default, so this has to be supplied explicitly. Never sent to the jumphost."
 }
 
 variable "admin_cidrs" {
@@ -87,14 +87,34 @@ variable "permit_root_ssh" {
 
 variable "appco_username" {
   type        = string
+  default     = null
   sensitive   = true
-  description = "SUSE Application Collection username. Used to authenticate the local-path-provisioner Helm chart pull (release.yaml) and the image pull secret in kubernetes/manifests/local-path-provisioner.yaml, and written into kubernetes/helm/values/aif-operator.yaml's credentials.applicationCollection.username."
+  description = "SUSE Application Collection username. Used to authenticate the local-path-provisioner / suse-storage Helm chart pulls (release.yaml) and their image pulls (kubernetes/manifests/local-path-provisioner.yaml's pull secret, suse-storage.yaml's privateRegistry), and written into kubernetes/helm/values/aif-operator.yaml's credentials.applicationCollection.username. Optional in the type, NOT in practice: required (validated at plan time) whenever components lists local-path-provisioner or suse-storage, since both are pulled from Application Collection and would otherwise sit in ImagePullBackOff with no StorageClass. When null, aif-operator.yaml omits the applicationCollection block. An empty string counts as unset."
+
+  validation {
+    # Both storage charts and their images live behind Application Collection
+    # auth. Without credentials the image still builds and boots, and the
+    # failure only shows up post-install as an ImagePullBackOff -- fail here
+    # instead, before anything is created. try(): trimspace(null) errors, and
+    # && does not short-circuit.
+    condition = (
+      !(contains(var.components, "local-path-provisioner") || contains(var.components, "suse-storage"))
+      || try(trimspace(var.appco_username) != "" && trimspace(var.appco_password) != "", false)
+    )
+    error_message = "components lists local-path-provisioner or suse-storage, which are pulled from SUSE Application Collection and need appco_username and appco_password. Set both, or drop the storage chart from components."
+  }
+
+  validation {
+    condition     = try(trimspace(var.appco_username) != "", false) == try(trimspace(var.appco_password) != "", false)
+    error_message = "appco_username and appco_password must be set together -- one without the other is never usable."
+  }
 }
 
 variable "appco_password" {
   type        = string
+  default     = null
   sensitive   = true
-  description = "SUSE Application Collection password/token, paired with appco_username."
+  description = "SUSE Application Collection password/token, paired with appco_username. See appco_username for when it is required."
 }
 
 variable "appco_registry" {
@@ -105,12 +125,19 @@ variable "appco_registry" {
 
 variable "suse_registration_code" {
   type        = string
+  default     = null
   sensitive   = true
-  description = "SUSE registration code, written as kubernetes/helm/values/aif-operator.yaml's credentials.suseRegistry.username -- per SUSE's own convention, the registry \"username\" for this registry is always the registration code itself."
+  description = "SUSE registration code, written as kubernetes/helm/values/aif-operator.yaml's credentials.suseRegistry.username -- per SUSE's own convention, the registry \"username\" for this registry is always the registration code itself. Optional but highly recommended: when null, aif-operator.yaml omits the suseRegistry block and aif-operator runs without SUSE registry credentials. An empty string counts as unset."
+
+  validation {
+    condition     = try(trimspace(var.suse_registration_code) != "", false) == try(trimspace(var.suse_registry_password) != "", false)
+    error_message = "suse_registration_code and suse_registry_password must be set together -- one without the other is never usable."
+  }
 }
 
 variable "suse_registry_password" {
   type        = string
+  default     = null
   sensitive   = true
   description = "Password paired with suse_registration_code for the SUSE registry, written into aif-operator.yaml's credentials.suseRegistry.password."
 }
@@ -119,7 +146,18 @@ variable "nvidia_api_key" {
   type        = string
   default     = null
   sensitive   = true
-  description = "NVIDIA NGC API key, written into aif-operator.yaml's credentials.nvidia.password. Optional: when null, the whole nvidia: credentials block is omitted from aif-operator.yaml rather than written with an empty password. The paired username, when the block is present, is always the literal string \"$oauthtoken\" -- NGC's own convention, not a secret -- so it is hardcoded in the template rather than exposed as a variable."
+  description = "NVIDIA NGC API key, written into aif-operator.yaml's credentials.nvidia.password. Optional but highly recommended: when null (or an empty string), the whole nvidia: credentials block is omitted from aif-operator.yaml rather than written with an empty password. The paired username is nvidia_username."
+}
+
+variable "nvidia_username" {
+  type        = string
+  default     = "$oauthtoken"
+  description = "Username written into aif-operator.yaml's credentials.nvidia.username alongside nvidia_api_key. Defaults to the literal string \"$oauthtoken\" -- NGC's own convention for API-key auth, not a secret. Override only if your NGC setup expects something else. Ignored when nvidia_api_key is unset."
+
+  validation {
+    condition     = trimspace(var.nvidia_username) != ""
+    error_message = "nvidia_username must not be empty; leave it at its \"$oauthtoken\" default unless you know otherwise."
+  }
 }
 
 variable "components" {
@@ -636,13 +674,13 @@ variable "fips" {
 variable "snapshot_id" {
   type        = string
   default     = null
-  description = "Override: use an already-imported Vultr snapshot instead of building one. When set, the jumphost-driven build/wait/lookup all drop to count = 0 (see snapshot.tf), which is how a redeploy reuses an image already built."
+  description = "Override: provision the nodes from a snapshot built outside this module instead of the one it imports (see snapshot.tf). Setting it drops vultr_snapshot_from_url.ai_factory to count = 0, which DESTROYS a snapshot this module already built -- the managed one needs no pinning, its id is known from state."
 }
 
 variable "deploy_nodes" {
   type        = bool
   default     = true
-  description = "Whether to provision the control-plane and GPU nodes (and, by extension, wait for the snapshot). false stands up only the network, load balancer and jumphost/image factory on their own."
+  description = "Whether to provision the control-plane and GPU nodes. false stands up only the network, load balancer and jumphost/image factory -- which still builds and imports the snapshot, so the apply still blocks on it."
 }
 
 variable "lb_backend_instance_ids" {
@@ -660,7 +698,24 @@ variable "lb_supervisor_extra_cidrs" {
 variable "image_build_timeout" {
   type        = number
   default     = 5400
-  description = "Seconds the snapshot-wait local-exec (scripts/wait-for-snapshot.sh) will poll the Vultr API before giving up. 5400 (90 min) gives headroom over a cold podman pull of the elemental image plus the raw build plus the snapshot import."
+  description = "Seconds scripts/wait-for-image.sh will poll the jumphost for the served raw before giving up. 5400 (90 min) gives headroom over a cold podman pull of the elemental image plus the raw build."
+}
+
+variable "image_serve_seconds" {
+  type        = number
+  default     = 3600
+  description = "Seconds the jumphost serves the raw after building it, then stops the http server and deletes the file. A fixed window because knowing when the import finished would need a Vultr API key on the jumphost. Also the timeout for scripts/wait-for-snapshot.sh, since an import still pending once serving stops will not complete."
+
+  validation {
+    condition     = var.image_serve_seconds >= 600
+    error_message = "image_serve_seconds must be at least 600: Vultr's fetch of a multi-GB raw takes minutes, and wait-for-snapshot.sh shares this as its timeout."
+  }
+}
+
+variable "image_import_port_open" {
+  type        = bool
+  default     = true
+  description = "Whether the jumphost's firewall group allows tcp/80 from 0.0.0.0/0 for Vultr's create-from-url fetcher (snapshot.tf). A Terraform resource, so it cannot be opened and closed within one apply: examples/ha-cluster/deploy.sh leaves it at the default on pass 1 and sets it false on pass 2, after the snapshot is complete. A rebuild with it false fails in wait-for-image.sh."
 }
 
 variable "verify_plan_availability" {

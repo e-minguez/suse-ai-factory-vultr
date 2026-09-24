@@ -70,46 +70,30 @@
 # load balancer stays down longer still: its health check is Traefik's own
 # /ping, which only answers once the cluster has finished deploying charts.
 #
-# WHY THIS SCRIPT PINS snapshot_id IN pass2.auto.tfvars.json, ON BOTH PASSES:
-# data.vultr_snapshot.ai_factory's read is deferred to apply time via
-# depends_on (needed on a genuine first build, since the snapshot doesn't
-# exist yet at plan time). Terraform defers a depends_on data source's read
-# whenever anything in its dependency chain shows pending changes in that
-# plan -- and vultr_instance.jumphost's user_data embeds the load balancer's
-# ipv4, which is a real config reference, so LB -> jumphost -> the wait
-# resource -> this data source is a genuine graph edge. The reset below
-# (attached_instances/firewall_rules back to []) means the LB itself has
-# pending changes on the very first plan of EVERY run -- which is enough to
-# defer the data source's read on pass 1 too, not just pass 2, making
-# local.effective_snapshot_id "known after apply" and forcing a full
-# ForceNew replace of every control-plane/GPU node, every single run, even
-# ones with zero real config changes.
+# PORT 80 AND THE SNAPSHOT:
+# The module imports the image with vultr_snapshot_from_url, which fetches it
+# off the jumphost over tcp/80. That rule is a Terraform resource gated by
+# image_import_port_open, so it cannot be opened and closed in one apply:
+# the reset below leaves the key out (default true, open) for pass 1, and
+# pass 2 writes false, closing it once the snapshot is complete. A routine
+# re-run therefore opens it for the length of pass 1 even when nothing is
+# rebuilt -- with nothing listening, since the jumphost stops serving
+# image_serve_seconds after its build.
 #
-# Fix: before pass 1, look up whatever snapshot_id is already recorded in
-# this directory's OWN state (a plain `terraform output`, which reads the
-# last-applied state file directly -- no plan/refresh involved, so nothing
-# here can itself trigger the bug). If one exists, write it into the SAME
-# reset of pass2.auto.tfvars.json below, alongside the emptied backend
-# lists: a literal string there is known at plan time on pass 1 too (the
-# file is auto-loaded, not just written for pass 2), which drops
-# data.vultr_snapshot.ai_factory and terraform_data.snapshot_ready to
-# count = 0 (var.snapshot_id overrides them, per snapshot.tf) and removes
-# the deferred-read path from the graph entirely for this run. When no
-# snapshot_id is recorded yet, or --rebuild was passed, the key is left out
-# of the file entirely (absent, not null, so var.snapshot_id's own default
-# applies) -- a bare -var "snapshot_id=" would not have that option, which is
-# why this uses the tfvars file for pass 1 too rather than a second -var flag.
+# snapshot_id is NOT pinned. The managed snapshot's id is known from state at
+# plan time, so an unchanged cluster plans no node replacement without it --
+# and pinning it would drop the managed resource to count = 0 and DESTROY the
+# snapshot the nodes run from.
 #
-# This means a routine re-run never rebuilds the image or touches running
-# nodes, by default. To force an actual rebuild (e.g. after changing
-# anything under modules/ai-factory-ha/templates), run:
+# Whether to rebuild is decided by time_static.build's triggers (snapshot.tf).
+# To force one regardless (e.g. to pick up a changed upstream image under the
+# same tag), run:
 #
 #   ./deploy.sh --rebuild
 #
-# which skips the pin on pass 1 and lets Terraform's own time_static.build
-# triggers decide, as originally designed, whether a new image is needed.
-# Pass 2 always re-pins from that run's own resolved output regardless, same
-# as before -- see the end of this script.
+# which adds -replace on time_static.build to pass 1. That replaces the
+# jumphost, the snapshot and every node built from it; the old snapshot is
+# deleted, not kept.
 #
 # USAGE:
 #   ./deploy.sh [--rebuild] [--yes] [-- | terraform apply args...]
@@ -125,10 +109,8 @@ usage() {
   cat <<'USAGE'
 Usage: ./deploy.sh [--rebuild] [--yes] [terraform apply args...]
 
-  --rebuild   Do not pin the snapshot already in state; let Terraform's
-              time_static.build triggers decide whether to build a fresh
-              image. Only meaningful when a cluster is already standing --
-              from an empty state every run builds fresh anyway.
+  --rebuild   Force a fresh image build on pass 1 (-replace on
+              time_static.build), replacing the snapshot and every node.
   --yes       Pass -auto-approve to both terraform apply passes.
   --help      Show this message.
   --          Stop parsing this script's flags; forward the rest verbatim.
@@ -169,58 +151,38 @@ if [[ -z "${VULTR_API_KEY:-}" ]]; then
   exit 1
 fi
 
-EXISTING_SNAPSHOT_ID=""
+PASS1_ARGS=()
 if [[ "$REBUILD" == true ]]; then
-  echo "==> --rebuild requested: not pinning snapshot_id, letting Terraform build+detect a fresh image"
-else
-  EXISTING_SNAPSHOT_ID=$(terraform output -raw snapshot_id 2>/dev/null || true)
-  if [[ -n "$EXISTING_SNAPSHOT_ID" ]]; then
-    echo "==> Reusing existing snapshot $EXISTING_SNAPSHOT_ID for pass 1 too (pass --rebuild to force a fresh image build)"
-  fi
+  echo "==> --rebuild requested: forcing a fresh image build on pass 1"
+  PASS1_ARGS+=(-replace=module.ha_cluster.time_static.build)
 fi
 
 echo "==> Resetting pass2.auto.tfvars.json to empty before pass 1 (see the comment above for why)"
-if [[ -n "$EXISTING_SNAPSHOT_ID" ]]; then
-  # snapshot_id present: pins pass 1 too, see the WHY comment above.
-  cat > pass2.auto.tfvars.json <<EOF
-{
-  "lb_backend_instance_ids": [],
-  "lb_supervisor_extra_cidrs": [],
-  "gpu_cloud_extra_cidrs": [],
-  "snapshot_id": "$EXISTING_SNAPSHOT_ID"
-}
-EOF
-else
-  # No recorded snapshot (first run) or --rebuild: the key is left out
-  # entirely, not set to null, so var.snapshot_id's own default applies and
-  # Terraform's time_static.build triggers decide as originally designed.
-  cat > pass2.auto.tfvars.json <<'EOF'
+# image_import_port_open is left out, not set to true, so the variable's own
+# default applies and port 80 is open for any import pass 1 has to do.
+cat > pass2.auto.tfvars.json <<'EOF'
 {
   "lb_backend_instance_ids": [],
   "lb_supervisor_extra_cidrs": [],
   "gpu_cloud_extra_cidrs": []
 }
 EOF
-fi
 
 echo "==> Pass 1: network, load balancer, jumphost image factory, control-plane + GPU nodes"
 echo "    (this blocks for tens of minutes once the jumphost starts building the image;"
 echo "     watch it with: ssh root@<jumphost_public_ipv4> tail -f /var/log/elemental-factory.log)"
-terraform apply ${TF_ARGS[@]+"${TF_ARGS[@]}"}
+terraform apply ${PASS1_ARGS[@]+"${PASS1_ARGS[@]}"} ${TF_ARGS[@]+"${TF_ARGS[@]}"}
 
-RESOLVED_SNAPSHOT_ID=$(terraform output -raw snapshot_id)
-
-echo "==> Pass 2: attach load balancer backends (API + ingress) and GPU supervisor CIDRs"
+echo "==> Pass 2: attach load balancer backends (API + ingress) and GPU supervisor CIDRs, close port 80"
 echo "    (neither LB has backends until this completes — a dead :6443 in between is expected)"
-# snapshot_id pins the value pass 1 just resolved, so pass 2 (and every plain
-# plan/apply after it, since this file is auto-loaded) never re-reads
-# data.vultr_snapshot.ai_factory -- see the WHY comment above.
+# image_import_port_open = false: the snapshot is complete by now (pass 1
+# blocked on it), so the import rule goes -- see PORT 80 above.
 cat > pass2.auto.tfvars.json <<EOF
 {
   "lb_backend_instance_ids": $(terraform output -json control_plane_ids),
   "lb_supervisor_extra_cidrs": $(terraform output -json gpu_node_cidrs),
   "gpu_cloud_extra_cidrs": $(terraform output -json nat_gateway_public_cidrs),
-  "snapshot_id": "$RESOLVED_SNAPSHOT_ID"
+  "image_import_port_open": false
 }
 EOF
 terraform apply ${TF_ARGS[@]+"${TF_ARGS[@]}"}

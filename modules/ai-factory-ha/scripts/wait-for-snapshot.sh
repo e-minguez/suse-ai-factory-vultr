@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Invoked from snapshot.tf via a local-exec provisioner, on the OPERATOR's
-# machine (not the jumphost). Polls the Vultr API for a snapshot matching
-# SNAPSHOT_DESCRIPTION and waits until it is "complete". Idempotent: if the
-# snapshot already exists and is complete, returns immediately, so a
-# re-applied/interrupted apply resumes cleanly.
+# Invoked from snapshot.tf via a creation-time local-exec provisioner on
+# vultr_snapshot_from_url, on the OPERATOR's machine (not the jumphost). The
+# provider returns as soon as Vultr accepts create-from-url, with the snapshot
+# still "pending"; this polls SNAPSHOT_ID until it is "complete", so nothing
+# downstream boots from a half-imported image.
 #
 # Needs only curl + python3 (json module) -- no jq dependency.
 set -euo pipefail
 
-: "${SNAPSHOT_DESCRIPTION:?SNAPSHOT_DESCRIPTION must be set}"
+: "${SNAPSHOT_ID:?SNAPSHOT_ID must be set}"
 : "${TIMEOUT_SECONDS:?TIMEOUT_SECONDS must be set}"
 : "${POLL_SECONDS:?POLL_SECONDS must be set}"
 
@@ -23,122 +23,86 @@ log() {
   echo "[wait-for-snapshot] $*" >&2
 }
 
-# Fetches every snapshot page (per_page=500, following meta.links.next) and
-# prints "<id>\t<status>" for the first one whose description matches exactly.
-# No jq: python3 does the JSON walking.
-#
-# Exit codes are three-way on purpose, because the caller has to tell "the
-# build hasn't produced it yet" apart from "the API didn't answer":
-#   0  found, printed
-#   1  the API answered and has no snapshot with that description
-#   2  transient API failure (5xx or a network error) -- nothing was learned
-find_snapshot() {
-  python3 - "$API_BASE" "$VULTR_API_KEY" "$SNAPSHOT_DESCRIPTION" <<'PYEOF'
-import json
-import socket
-import sys
-import urllib.error
-import urllib.request
-
-# Force IPv4: on a dual-stack host, an IP-restricted VULTR_API_KEY gets 401
-# "Unauthorized IP address: <ipv6>" because urllib prefers the AAAA record.
-# Same failure the jumphost's factory script hits.
-_getaddrinfo = socket.getaddrinfo
-socket.getaddrinfo = lambda host, port, family=0, type=0, proto=0, flags=0: (
-    _getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
-)
-
-api_base, api_key, description = sys.argv[1], sys.argv[2], sys.argv[3]
-url = f"{api_base}/snapshots?per_page=500"
-
-while url:
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"})
-    try:
-        with urllib.request.urlopen(req) as resp:
-            data = json.load(resp)
-    except urllib.error.HTTPError as exc:
-        # 5xx is a platform-side outage or maintenance window; only a 4xx
-        # says anything about our request.
-        if exc.code >= 500:
-            print(f"{exc.code} {exc.reason}", file=sys.stderr)
-            sys.exit(2)
-        # 401/403 is a wrong or IP-restricted key, 429 is a rate limit we are
-        # not going to outwait -- polling for another hour helps neither.
-        print(f"{exc.code} {exc.reason}: {exc.read(2048).decode(errors='replace')}", file=sys.stderr)
-        sys.exit(3)
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        print(f"network error: {exc}", file=sys.stderr)
-        sys.exit(2)
-
-    for snap in data.get("snapshots", []):
-        if snap.get("description") == description:
-            print(f"{snap.get('id')}\t{snap.get('status')}")
-            sys.exit(0)
-
-    next_url = data.get("meta", {}).get("links", {}).get("next")
-    url = next_url if next_url else None
-
-sys.exit(1)
-PYEOF
+# Recovery for a vanished record, printed on both paths that can mean it.
+state_rm_hint() {
+  log "The resource is now in state with an id Vultr no longer knows, and the provider errors on"
+  log "the 404 at refresh. Before re-running apply:"
+  log "  terraform state rm 'module.ha_cluster.vultr_snapshot_from_url.ai_factory[0]'"
 }
 
-log "polling for snapshot description \"$SNAPSHOT_DESCRIPTION\" (timeout ${TIMEOUT_SECONDS}s, every ${POLL_SECONDS}s)"
+log "polling snapshot $SNAPSHOT_ID until complete (timeout ${TIMEOUT_SECONDS}s, every ${POLL_SECONDS}s)"
 
 START_TIME=$(date +%s)
 LAST_PROGRESS_LOG=$START_TIME
-SNAPSHOT_ID=""
-SNAPSHOT_STATUS=""
+STATUS=""
+# api.vultr.com returns 502 during platform maintenance windows, including
+# mid-import. Not fatal and does not reset the clock: the import proceeds on
+# Vultr's side whether or not their API answers.
+TRANSIENT=0
+MAX_TRANSIENT=20
 
 while true; do
   NOW=$(date +%s)
   ELAPSED=$((NOW - START_TIME))
 
-  RC=0
-  RESULT=$(find_snapshot) || RC=$?
+  # Not -f: a 404 has a meaning here, diagnosed below. -4 because an
+  # IP-restricted key gets 401 "Unauthorized IP address: <ipv6>" on a
+  # dual-stack host.
+  HTTP_CODE=$(curl -4 -sS -o /tmp/wait-for-snapshot.$$.json -w '%{http_code}' \
+    -H "Authorization: Bearer $VULTR_API_KEY" \
+    "$API_BASE/snapshots/$SNAPSHOT_ID" || true)
+  BODY=$(cat /tmp/wait-for-snapshot.$$.json 2>/dev/null || true)
+  rm -f /tmp/wait-for-snapshot.$$.json
 
-  case "$RC" in
-    0)
-      SNAPSHOT_ID=$(printf '%s' "$RESULT" | cut -f1)
-      SNAPSHOT_STATUS=$(printf '%s' "$RESULT" | cut -f2)
-
-      if [ "$SNAPSHOT_STATUS" = "complete" ]; then
-        log "snapshot $SNAPSHOT_ID (\"$SNAPSHOT_DESCRIPTION\") is complete after ${ELAPSED}s"
-        break
-      fi
-
-      if [ "$SNAPSHOT_STATUS" != "pending" ]; then
-        log "ERROR: snapshot $SNAPSHOT_ID (\"$SNAPSHOT_DESCRIPTION\") is in unexpected/terminal status \"$SNAPSHOT_STATUS\", not \"pending\" or \"complete\""
+  case "$HTTP_CODE" in
+    200)
+      TRANSIENT=0
+      STATUS=$(python3 -c 'import json,sys
+print(json.loads(sys.argv[1]).get("snapshot", {}).get("status", ""))' "$BODY")
+      case "$STATUS" in
+        complete)
+          log "snapshot $SNAPSHOT_ID is complete after ${ELAPSED}s"
+          break
+          ;;
+        pending) ;;
+        *)
+          log "ERROR: snapshot $SNAPSHOT_ID is in unexpected/terminal status \"$STATUS\", not \"pending\" or \"complete\""
+          exit 1
+          ;;
+      esac
+      ;;
+    404)
+      log "ERROR: snapshot $SNAPSHOT_ID no longer exists. Vultr deletes the record when its fetcher"
+      log "cannot retrieve the image, so the import never got the file: most likely port 80 had not"
+      log "propagated at the edge Vultr fetched through, or the jumphost's serve window ran out."
+      log "The jumphost's http access log (/var/log/elemental-factory.log) shows whether any address"
+      log "besides 127.0.0.1 and yours ever fetched it."
+      state_rm_hint
+      exit 1
+      ;;
+    000 | 5??)
+      TRANSIENT=$((TRANSIENT + 1))
+      log "transient: HTTP $HTTP_CODE from the Vultr API ($TRANSIENT/$MAX_TRANSIENT consecutive)"
+      if [ "$TRANSIENT" -ge "$MAX_TRANSIENT" ]; then
+        log "ERROR: the Vultr API has been unavailable for $MAX_TRANSIENT consecutive polls, giving up. The snapshot may still complete -- check 'vultr-cli snapshot get $SNAPSHOT_ID'."
         exit 1
       fi
       ;;
-    1)
-      : # the API answered, the snapshot is not there yet -- keep waiting
-      ;;
-    2)
-      # Not fatal and does not reset the clock: the build proceeds on Vultr's
-      # side whether or not their API answers. Logged every time, since a run
-      # of these explains an otherwise inexplicable timeout.
-      log "transient: the Vultr API did not answer this poll (see the error above); still waiting (${ELAPSED}s elapsed)"
-      ;;
     *)
-      log "ERROR: the Vultr API rejected the request (see the error above). This is a credentials or rate-limit problem, not a build problem -- VULTR_API_KEY must be valid and, if it is IP-restricted, must allow this machine's address."
+      log "ERROR: the Vultr API rejected the request (HTTP $HTTP_CODE): $BODY"
+      log "This is a credentials or rate-limit problem, not a build problem -- VULTR_API_KEY must be valid and, if it is IP-restricted, must allow this machine's address."
       exit 1
       ;;
   esac
 
   if [ "$ELAPSED" -ge "$TIMEOUT_SECONDS" ]; then
-    log "ERROR: timed out after ${ELAPSED}s waiting for snapshot \"$SNAPSHOT_DESCRIPTION\" to become complete."
-    log "A missing snapshot and a failed image build look identical from here, by design -- check the build log on the jumphost:"
-    log "  ssh <jumphost> tail -f /var/log/elemental-factory.log"
+    log "ERROR: timed out after ${ELAPSED}s with snapshot $SNAPSHOT_ID still \"$STATUS\". The jumphost has stopped serving by now, so it will not complete."
+    state_rm_hint
     exit 1
   fi
 
   if [ $((NOW - LAST_PROGRESS_LOG)) -ge 60 ]; then
-    if [ -n "$SNAPSHOT_ID" ]; then
-      log "still waiting: snapshot $SNAPSHOT_ID status=$SNAPSHOT_STATUS (${ELAPSED}s elapsed)"
-    else
-      log "still waiting: no snapshot named \"$SNAPSHOT_DESCRIPTION\" found yet (${ELAPSED}s elapsed) -- the jumphost may still be building"
-    fi
+    log "still waiting: snapshot $SNAPSHOT_ID status=${STATUS:-unknown} (${ELAPSED}s elapsed)"
     LAST_PROGRESS_LOG=$NOW
   fi
 
@@ -182,4 +146,4 @@ else
   log "EFI flag not reported by the Vultr API (expected -- uefi is write-only on this endpoint)"
 fi
 
-log "snapshot \"$SNAPSHOT_DESCRIPTION\" ($SNAPSHOT_ID) ready"
+log "snapshot $SNAPSHOT_ID ready"

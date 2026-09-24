@@ -21,8 +21,8 @@ terraform {
       version = "~> 3.6"
     }
 
-    # time_static (snapshot.tf) pins the snapshot description's timestamp at
-    # create time; timestamp() would re-evaluate on every plan.
+    # time_static (snapshot.tf) pins the build's timestamp at create time;
+    # timestamp() would re-evaluate on every plan.
     time = {
       source  = "hashicorp/time"
       version = "~> 0.12"

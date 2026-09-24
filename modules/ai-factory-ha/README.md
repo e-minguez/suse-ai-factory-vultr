@@ -7,9 +7,11 @@ the Kubernetes API VIP, and any mix of GPU worker pools -- bare metal, cloud,
 or both at once -- joined over the same VPC.
 
 The module builds its own snapshot as part of the apply: the jumphost pulls
-the elemental container image, runs `podman ... customize --type raw`, serves
-the result over HTTP, and calls Vultr's `create-from-url`. Terraform then
-polls the Vultr API for that snapshot before provisioning nodes from it. See
+the elemental container image, runs `podman ... customize --type raw` and
+serves the result over HTTP; Terraform imports it with
+`vultr_snapshot_from_url` and waits for it to complete before provisioning
+nodes from it. The snapshot is in Terraform state, so `terraform destroy`
+deletes it, and the jumphost never holds a Vultr API key. See
 `examples/ha-cluster` for a runnable example and `deploy.sh`.
 
 ## Topology
@@ -40,15 +42,17 @@ Creation order:
 2  vultr_nat_gateway      egress for the vpc_only control-plane nodes
 3  vultr_load_balancer    api + ingress; Vultr assigns their IPv4s, backends still empty
 4  jumphost               builds the elemental image with the API LB's IPv4 baked in as
-                          apiVIP and the ingress LB's as Rancher's hostname,
-                          imports it as a Vultr snapshot
-5  wait for snapshot      Terraform polls GET /v2/snapshots for an agreed description
+                          apiVIP and the ingress LB's as Rancher's hostname, serves it
+                          on :80 for image_serve_seconds; tcp/80 rule opened alongside
+5  snapshot               Terraform polls the served URL from your machine, then
+                          vultr_snapshot_from_url, then polls it until "complete"
 6  cp-01/02/03            vultr_instance, vpc_only, no public NIC at all
    <pool>-NN              vultr_bare_metal_server, vpc_id, public IP unavoidable
    <pool>-NN              vultr_instance, vpc_ids, vpc_only by default, else firewalled
 ── second apply pass ─────────────────────────────────────────────────────
 7  LB backends + rules    control-plane instance IDs, GPU /32s and the NAT
                           gateway's public /32s, fed back in
+   close tcp/80           image_import_port_open = false
 ```
 
 ## Why the LB backends are a variable, and why there are two apply passes
@@ -61,9 +65,9 @@ close a dependency cycle:
 
 ```
 vultr_load_balancer.api      ──▶ attached_instances = vultr_instance.control_plane[*].id
-vultr_instance.control_plane ──▶ data.vultr_snapshot.ai_factory
-data.vultr_snapshot          ──▶ terraform_data.snapshot_ready
-terraform_data.snapshot_ready──▶ vultr_instance.jumphost
+vultr_instance.control_plane ──▶ vultr_snapshot_from_url.ai_factory
+vultr_snapshot_from_url      ──▶ terraform_data.image_served
+terraform_data.image_served  ──▶ vultr_instance.jumphost
 vultr_instance.jumphost      ──▶ user_data contains vultr_load_balancer.api.ipv4
         └───────────────────────── back to the top
 ```
@@ -101,6 +105,13 @@ the next plain `terraform apply` would see `[]` again and detach every backend.
 Terraform still owns the backend list end to end — no `ignore_changes`, no
 drift, and it self-heals if a node is replaced. Both passes are re-runnable:
 pass 1's snapshot wait is a no-op once the snapshot exists.
+
+Pass 2 also sets `image_import_port_open = false`. The jumphost's tcp/80 rule
+for Vultr's fetcher is a `vultr_firewall_rule`, so it cannot be opened and
+closed within one apply; pass 1 leaves it at its default (open) and pass 2
+removes it once the snapshot is complete. A routine re-run opens it again for
+the length of pass 1, with nothing listening unless a rebuild is under way —
+the jumphost stops serving `image_serve_seconds` after its build.
 
 ## Ingress: Traefik on hostPorts, behind its own load balancer
 
@@ -447,9 +458,9 @@ which is off the combination SUSE tests. That is currently unavoidable.
 
 ## What triggers an image rebuild
 
-`time_static.build` records the instant of the current build, and
-`local.snapshot_description` is derived from it (`<cluster>-YYYYMMDD-hhmmss`,
-UTC). Its `triggers` are `cluster_name`, the load balancer's IPv4,
+`time_static.build` records the instant of the current build; the served
+file name (`<cluster>-YYYYMMDD-hhmmss.raw`, UTC) and `random_id.serve_path`
+are derived from it. Its `triggers` are `cluster_name`, the load balancer's IPv4,
 `elemental_image`, `sha256(jsonencode(local.elemental_files))` — the
 *rendered* config dir, so a change to a variable alone still counts — plus two
 inputs that reach the build only through `image-factory.sh` and therefore
@@ -457,9 +468,10 @@ cannot ride in `elemental_files`: `sha256` of the **content** behind
 `local.aif_release_manifest_url` (the URL derived from `aif_version`, or
 `aif_release_manifest_url` when set), and
 `sha256(jsonencode(var.sysext_image_overrides))`.
-Change any of them and the description changes, which makes
-`vultr_instance.jumphost`'s `user_data` `ForceNew`: the jumphost is replaced
-and builds a new image.
+Change any of them and `random_id.serve_path` rotates, which makes
+`vultr_instance.jumphost`'s `user_data` `ForceNew` — the jumphost is replaced
+and builds a new image — and, through `replace_triggered_by`, replaces
+`vultr_snapshot_from_url.ai_factory` and with it every node.
 
 The manifest trigger hashes the fetched body, not the URL, so a URL pointing
 at a moving branch ref still rebuilds when the far end changes.
@@ -476,11 +488,16 @@ The practical consequences:
 - **So is changing `ingress_controller`**, and so is anything that moves the
   ingress load balancer's IPv4 — it reaches the image as `rancher_hostname`
   inside `rancher.yaml`, which the `elemental_files` hash covers.
-- `examples/ha-cluster/deploy.sh` pins the existing snapshot (from
-  `terraform output -raw snapshot_id`) unless run with `--rebuild`. From an
-  empty state there is no output to read, so a plain run always builds fresh.
-- Snapshots accumulate: `terraform destroy` never removes them, because
-  Terraform only ever *reads* them through a data source.
+- **A jumphost replaced for any other reason does not rebuild the cluster.**
+  The snapshot's `url` embeds the jumphost's IP and is `ForceNew`, so it is
+  in `ignore_changes`; only the build id replaces it. The new jumphost still
+  builds and serves an image nobody imports.
+- **A rebuild deletes the previous snapshot.** It is replaced, not kept, so
+  there is no rolling back to it. `examples/ha-cluster/deploy.sh --rebuild`
+  forces one with `-replace` on `time_static.build`.
+- **`snapshot_id` is not a pin any more.** Setting it drops the managed
+  snapshot to `count = 0` and destroys it; it is only for images built
+  outside this module.
 - **Editing a comment in a template does *not* rebuild.** See below.
 
 ### Comments are stripped before anything is rendered
@@ -515,7 +532,7 @@ What it does and does not touch:
 - Never runs on `cloud-init.yaml.tftpl` — see the section above.
 - `image-factory.sh` is stripped by a **separate** expression rather than
   merged into one map with the elemental files. Merging them is a dependency
-  cycle: the script interpolates `snapshot_description`, which comes from
+  cycle: the script interpolates `image_file`, which comes from
   `time_static.build`, whose trigger is the hash of `elemental_files`.
 
 The practical rule: comment the templates as heavily as they deserve. The
@@ -767,21 +784,28 @@ the default derivation that trigger is inert — a tag does not move — and it
 earns its keep only when `aif_release_manifest_url` points at a branch; see
 [above](#suse-ai-factory-version).
 
-local-path-provisioner's chart pulls from an authenticated Application
-Collection repository, so `release.yaml` carries `appco_username`/
-`appco_password` credentials for it, and
+local-path-provisioner's and suse-storage's charts pull from an
+authenticated Application Collection repository, so `release.yaml` carries
+`appco_username`/`appco_password` credentials for them — which is why those
+two variables, though they default to `null`, are validated as **required**
+whenever either storage chart is in `components`: the plan fails up front
+instead of the cluster coming up with a provisioner stuck in
+`ImagePullBackOff` and no working StorageClass. For
+local-path-provisioner,
 `kubernetes/manifests/local-path-provisioner.yaml` creates the matching
 `application-collection` image pull secret the chart's own values expect
 (Terraform computes the `dockerconfigjson`, not a manifest placeholder).
-`aif-operator.yaml` needs two required credential pairs and one optional
-one: the same Application Collection ones, a SUSE registration code
+`aif-operator.yaml` takes three credential sets, all optional but highly
+recommended: the same Application Collection ones, a SUSE registration code
 (`suse_registration_code` — per SUSE's convention, the registry "username"
-for that registry is the regcode itself) with `suse_registry_password`,
-and an *optional* NVIDIA NGC API key (`nvidia_api_key`, default `null`;
-NGC's username is always the literal `$oauthtoken`, so it isn't a
-variable). When `nvidia_api_key` is `null`, the whole `nvidia:` credentials
-block is omitted from `aif-operator.yaml` rather than written with an empty
-password. `rancher.yaml` gets a hostname and bootstrap password that the
+for that registry is the regcode itself) with `suse_registry_password`, and
+an NVIDIA NGC API key (`nvidia_api_key`, paired with `nvidia_username`,
+which defaults to NGC's literal `$oauthtoken` convention). Each set left `null` (or
+`""`) is omitted from `aif-operator.yaml`'s `credentials:` block rather than
+written with empty values, and each username/password pair is validated to
+be set together or not at all. In practice the appco pair is always present
+with aif-operator, since aif-operator requires a storage chart and both
+storage charts require it. `rancher.yaml` gets a hostname and bootstrap password that the
 manifest doesn't otherwise set — see `rancher_hostname` and
 `rancher_bootstrap_password`.
 
@@ -792,13 +816,11 @@ Required, no default:
 | Variable | Type | Why it can't be defaulted |
 |---|---|---|
 | `region` | `string` | plan availability and GPU stock are per-region; there is no sane default |
-| `vultr_api_key` | `string`, sensitive | the jumphost needs it to call `create-from-url`; the provider's own key comes from the environment, and Terraform can't read an env var into a default |
+| `vultr_api_key` | `string`, sensitive | `availability.tf`'s plan-time stock checks call the API through the http provider; the vultr provider's own key comes from the environment, and Terraform can't read an env var into a default. Never sent to the jumphost |
 | `admin_cidrs` | `list(string)` | defaulting SSH to `0.0.0.0/0` would be wrong, and defaulting to `[]` would silently lock you out |
 | `root_password_hash` | `string`, sensitive | goes into the image's `butane.yaml`; without it there is no console login on any node, and no password for `su -` |
 | `node_user_password_hash` | `string`, sensitive | the unprivileged account's own password, validated to differ from `root_password_hash` — otherwise the split buys nothing |
 | `ssh_authorized_keys` | `list(string)` | without at least one key, nothing has a way in over SSH at all — see below |
-| `appco_username`, `appco_password` | `string`, sensitive | SUSE Application Collection credentials; no sane default for a credential |
-| `suse_registration_code`, `suse_registry_password` | `string`, sensitive | SUSE registry credentials; same reasoning |
 
 Everything else has a default — see `variables.tf` for the full list and the
 reasoning behind each one. Notable ones:
@@ -817,15 +839,21 @@ reasoning behind each one. Notable ones:
 | `api_host` | `null` | defaults to `"rke2-<api_vip>.sslip.io"`, written as elemental `network.apiHost` and therefore into the API server certificate's SANs |
 | `ingress_controller` | `"traefik"` | see [Ingress](#ingress-traefik-on-hostports-behind-its-own-load-balancer); `"none"` drops the ingress load balancer, `"ingress-nginx"` is EOL upstream |
 | `ingress_cidrs` | `["0.0.0.0/0"]` | who may reach the ingress load balancer on 80/443 |
-| `deploy_nodes` | `true` | `false` stands up only the network, load balancer and jumphost — useful for building the image without paying for nodes yet |
-| `snapshot_id` | `null` | override: skip the build and wait, provision straight from an existing snapshot |
+| `deploy_nodes` | `true` | `false` stands up only the network, load balancer and jumphost — useful for building the image without paying for nodes yet. The snapshot is still imported, so the apply still blocks on it |
+| `snapshot_id` | `null` | override: provision from a snapshot built outside this module. **Destroys** the managed snapshot if one exists |
+| `image_serve_seconds` | `3600` | how long the jumphost serves the raw before stopping; also the timeout for the snapshot's `complete` wait |
+| `image_import_port_open` | `true` | the jumphost's tcp/80 rule for the import; `deploy.sh` sets it `false` on pass 2 |
+| `image_build_timeout` | `5400` | how long Terraform waits for the jumphost to serve the raw |
 | `lb_backend_instance_ids` | `[]` | see [above](#why-the-lb-backends-are-a-variable-and-why-there-are-two-apply-passes) |
 | `lb_supervisor_extra_cidrs` | `[]` | same |
 | `fips` | `false` | the upstream example enables FIPS by default but warns every node must then be FIPS-ready — not a call to make silently |
 | `rancher_hostname` | `null` | defaults to `"rancher-<ingress_lb_ipv4>.sslip.io"` (computed in `locals.tf`) when null — the ingress load balancer, not the API one |
 | `rancher_bootstrap_password` | `null` | defaults to a generated `random_password` when null — see `outputs.rancher_bootstrap_password` |
 | `appco_registry` | `"dp.apps.rancher.io"` | best-evidence guess at the container registry host behind Application Collection's only documented OCI endpoint; override if wrong |
-| `nvidia_api_key` | `null` | optional; when unset, `aif-operator.yaml`'s `nvidia:` credentials block is omitted entirely |
+| `appco_username`, `appco_password` | `null` | **required** (plan-time validation) when `components` lists `local-path-provisioner` or `suse-storage`; otherwise optional. When unset, `aif-operator.yaml`'s `applicationCollection:` block is omitted |
+| `suse_registration_code`, `suse_registry_password` | `null` | optional but highly recommended; when unset, `aif-operator.yaml`'s `suseRegistry:` block is omitted |
+| `nvidia_api_key` | `null` | optional but highly recommended; when unset, `aif-operator.yaml`'s `nvidia:` credentials block is omitted entirely |
+| `nvidia_username` | `"$oauthtoken"` | NGC's convention for API-key auth; override only if your NGC setup expects something else |
 | `aif_version` | `"2.2.0"` | which AI Factory release manifest to build against. Becomes SUSE/aif's `aif-operator-<version>` tag, so it must be a full `X.Y.Z` (no `"2.2"`), optionally with a pre-release suffix (`"2.3.0-dev.2"`); `2.1.0` is the floor, since `aif-operator-2.0.x` ships no manifest. A tag, not a branch, because it cannot move under a built cluster — but a `check` block still warns when the manifest's own `metadata.version` disagrees, which upstream does. Selects **charts only** — the OS side is `elemental_image` / `core_platform_override` / `sysext_image_overrides`. See [above](#suse-ai-factory-version). Changing it rebuilds the image and replaces every node |
 | `aif_release_manifest_url` | `null` | override: a full raw URL to a release manifest, for a branch ref, a fork or a mirror. When set, `aif_version` is ignored |
 | `components` | `["rancher", "gpu-operator", "local-path-provisioner", "aif-operator"]` | which AI Factory Helm charts `release.yaml` enables — see [above](#suse-ai-factory-components). Changing it rebuilds the image and replaces every node |
@@ -843,7 +871,7 @@ reasoning behind each one. Notable ones:
 | `ingress_lb_ipv4`, `ingress_endpoint` | the ingress LB's address; both `null` when `ingress_controller = "none"` |
 | `nat_gateway_private_ip`, `nat_gateway_public_ips` | the NAT gateway's VPC and public sides |
 | `vpc_subnet` | the cluster VPC's CIDR |
-| `snapshot_id` | the effective snapshot (built or overridden) |
+| `snapshot_id` | the effective snapshot (imported or overridden) |
 | `rke2_token` | sensitive; shared join token |
 | `rancher_hostname`, `rancher_url`, `rancher_bootstrap_password` | Rancher's ingress hostname, the same as a URL, and the initial admin password (sensitive) |
 | `control_plane_ids`, `control_plane_internal_ip` | control-plane instance IDs and VPC addresses |
@@ -877,9 +905,24 @@ specifically to be fed back as `lb_backend_instance_ids` /
   (openSUSE's community continuous build, checkable the same way) remains a
   fallback.
 - **UEFI on the imported snapshot cannot be verified through the Terraform
-  provider.** The `vultr_snapshot` data source exposes no UEFI-ish field;
-  `scripts/wait-for-snapshot.sh` best-effort-checks the raw API response and
-  logs what it finds. The real guarantee is a node that actually boots.
+  provider.** `vultr_snapshot_from_url` sends `use_uefi = true`, but the
+  field is write-only in the API; `scripts/wait-for-snapshot.sh`
+  best-effort-checks the raw response and logs what it finds. The real
+  guarantee is a node that actually boots.
+- **The snapshot import is attempted once; a failure means re-running
+  apply.** The provider makes a single `create-from-url` call and has no
+  retry. Vultr's fetcher occasionally misses a freshly created firewall rule
+  that has not reached its edge yet; `scripts/wait-for-image.sh` fetching the
+  URL from your machine first makes that rarer, not impossible. When it
+  happens Vultr deletes the snapshot record, `wait-for-snapshot.sh` fails
+  with a 404, and the provider then **errors on that 404 at every refresh**
+  instead of dropping the resource. Recover with
+  `terraform state rm 'module.ha_cluster.vultr_snapshot_from_url.ai_factory[0]'`
+  and re-run — `./deploy.sh --rebuild` if the jumphost's serve window
+  (`image_serve_seconds`) has run out, since nothing is served any more.
+- **The jumphost serves for a fixed window, not until the import is done.**
+  Knowing when Vultr finished would need an API key on the jumphost, which
+  it deliberately no longer has.
 - **SSH lands on `node_username`, not root.** The image's `butane.yaml`
   creates that account (default `suse`) with `node_user_password_hash` and
   `ssh_authorized_keys`, enables `sshd.service`, and drops a
@@ -919,10 +962,10 @@ specifically to be fed back as `lb_backend_instance_ids` /
   with data on it. A related unknown: if `/etc` is ephemeral on this image,
   `iscsi-prep.service` regenerates the iSCSI `InitiatorName` on every boot and
   leaves stale node records behind. The script is idempotent either way.
-- **The retry paths are stub-tested only.** The `create-from-url` import retry
-  in `image-factory.sh` and the 5xx handling in `scripts/wait-for-snapshot.sh`
-  were written against real failures but have only been *exercised* against a
-  stub HTTP server. Every build since has succeeded first try.
+- **The Terraform-managed import has not run against Vultr yet.**
+  `vultr_snapshot_from_url`, `wait-for-image.sh` and the reworked
+  `wait-for-snapshot.sh` are statically validated only. The 5xx handling in
+  `wait-for-snapshot.sh` has only been exercised against a stub HTTP server.
 
 ## Non-goals
 
@@ -937,5 +980,5 @@ Deliberate omissions, not gaps:
 - **Narrowing the cloud GPU firewall rules below the control plane's port
   list.** Over-narrowing risks breaking a working cluster for no measurable
   gain.
-- **Day-2 operations** — snapshot rotation, cluster upgrades, tearing the
+- **Day-2 operations** — cluster upgrades, tearing the
   jumphost down once the build has finished.
