@@ -29,7 +29,7 @@ output "api_host" {
 }
 
 output "ingress_lb_ipv4" {
-  description = "The ingress load balancer's IPv4 -- where 80/443 are forwarded to Traefik's hostPorts on the control-plane nodes. null when ingress_controller is \"none\"."
+  description = "The ingress load balancer's IPv4 -- where 80/443 are forwarded to Traefik's hostPorts on the control-plane nodes. null unless ingress_controller is \"traefik\"."
   value       = local.ingress_lb_ipv4
 }
 

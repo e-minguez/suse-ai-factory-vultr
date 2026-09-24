@@ -14,7 +14,7 @@ resource "random_password" "rancher_bootstrap" {
 }
 
 locals {
-  # null when ingress_controller = "none". Both names below are baked into the
+  # null unless ingress_controller = "traefik". Both names below are baked into the
   # image, so both load balancers must exist before the jumphost does -- they
   # do, nothing in either references a node.
   ingress_lb_ipv4 = one(vultr_load_balancer.ingress[*].ipv4)

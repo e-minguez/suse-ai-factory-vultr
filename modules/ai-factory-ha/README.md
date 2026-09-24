@@ -837,7 +837,7 @@ reasoning behind each one. Notable ones:
 | `lb_nodes` | `1` | validated odd (provider requirement); applies to both load balancers |
 | `api_vip_mode` | `"external"` | Vultr LB owns the API address; `"managed"` would hand it to MetalLB instead |
 | `api_host` | `null` | defaults to `"rke2-<api_vip>.sslip.io"`, written as elemental `network.apiHost` and therefore into the API server certificate's SANs |
-| `ingress_controller` | `"traefik"` | see [Ingress](#ingress-traefik-on-hostports-behind-its-own-load-balancer); `"none"` drops the ingress load balancer, `"ingress-nginx"` is EOL upstream |
+| `ingress_controller` | `"traefik"` | see [Ingress](#ingress-traefik-on-hostports-behind-its-own-load-balancer); only `"traefik"` gets the ingress load balancer; `"ingress-nginx"` is EOL upstream |
 | `ingress_cidrs` | `["0.0.0.0/0"]` | who may reach the ingress load balancer on 80/443 |
 | `deploy_nodes` | `true` | `false` stands up only the network, load balancer and jumphost — useful for building the image without paying for nodes yet. The snapshot is still imported, so the apply still blocks on it |
 | `snapshot_id` | `null` | override: provision from a snapshot built outside this module. **Destroys** the managed snapshot if one exists |
@@ -868,7 +868,7 @@ reasoning behind each one. Notable ones:
 | `jumphost_public_ipv4`, `jumphost_vpc_ip` | the jumphost's addresses |
 | `jumphost_ssh_login` | `<jumphost_username or root>@<public ipv4>`, ready to pass to `ssh` |
 | `kubernetes_api_endpoint`, `api_vip`, `api_host` | the API LB's address as a URL and a bare IPv4, plus the `sslip.io` name in the server certificate's SANs |
-| `ingress_lb_ipv4`, `ingress_endpoint` | the ingress LB's address; both `null` when `ingress_controller = "none"` |
+| `ingress_lb_ipv4`, `ingress_endpoint` | the ingress LB's address; both `null` unless `ingress_controller = "traefik"` |
 | `nat_gateway_private_ip`, `nat_gateway_public_ips` | the NAT gateway's VPC and public sides |
 | `vpc_subnet` | the cluster VPC's CIDR |
 | `snapshot_id` | the effective snapshot (imported or overridden) |
