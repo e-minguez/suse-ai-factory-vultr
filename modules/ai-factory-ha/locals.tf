@@ -17,16 +17,16 @@ locals {
   # null unless ingress_controller = "traefik". Both names below are baked into the
   # image, so both load balancers must exist before the jumphost does -- they
   # do, nothing in either references a node.
-  ingress_lb_ipv4 = one(vultr_load_balancer.ingress[*].ipv4)
+  ingress_lb_ipv4 = lookup(local.lb_ipv4, "ingress", null)
 
   # Rancher's ingress answers on the INGRESS load balancer, not the API one --
   # that is where 80/443 are forwarded. Falls back to the API address when
   # there is no ingress controller, where the name resolves but nothing serves
   # it; there is no better answer, and Rancher's chart requires a hostname.
-  rancher_hostname           = coalesce(var.rancher_hostname, "rancher-${coalesce(local.ingress_lb_ipv4, vultr_load_balancer.api.ipv4)}.sslip.io")
+  rancher_hostname           = coalesce(var.rancher_hostname, "rancher-${coalesce(local.ingress_lb_ipv4, local.api_vip)}.sslip.io")
   rancher_bootstrap_password = coalesce(var.rancher_bootstrap_password, random_password.rancher_bootstrap.result)
 
-  api_host = coalesce(var.api_host, "rke2-${vultr_load_balancer.api.ipv4}.sslip.io")
+  api_host = coalesce(var.api_host, "rke2-${local.api_vip}.sslip.io")
 
   # A TAG, not a branch: SUSE/aif tags per component, and aif-operator's tag is
   # the one that moves with the AI Factory version as a whole ("2.2.0" ->
@@ -467,7 +467,7 @@ locals {
       sysext                = null
     }
     gpu-operator = {
-      values_file           = null
+      values_file           = "gpu-operator.yaml"
       chart_credentials     = false
       pull_secret_namespace = null
       sysext                = null
@@ -502,14 +502,12 @@ locals {
   # dependsOn is resolved automatically and recursively by elemental itself
   # (internal/config/helm.go's enabledHelmCharts/addChart inserts a dependency
   # BEFORE its dependent), so this list only has to avoid contradicting that --
-  # its actual job is making var.components' DEFAULT render release.yaml
-  # byte-for-byte identical to what this module shipped before `components`
-  # existed. That matters here specifically: release.yaml is in
-  # local.elemental_files, sha256'd into time_static.build's trigger, which
-  # names the snapshot -- ForceNew on every node -- so a reordered default
-  # would propose destroying a running cluster on nothing but an upgrade of
-  # this module. Treat the default's byte-identical rendering as an
-  # acceptance test, not a nicety.
+  # its actual job is making release.yaml depend only on WHICH components are
+  # selected, never on the order they were typed in. That matters here
+  # specifically: release.yaml is in local.elemental_files, sha256'd into
+  # time_static.build's trigger, which names the snapshot -- ForceNew on every
+  # node -- so merely reordering var.components would otherwise propose
+  # destroying a running cluster.
   component_order = [
     "cert-manager", "rancher", "gpu-operator",
     "local-path-provisioner", "suse-storage", "aif-operator",
@@ -525,9 +523,8 @@ locals {
 
   # Extensions the enabled charts need, in the same canonical order, deduped
   # (distinct) so two charts naming one extension emit it once. Empty for the
-  # default chart set, which is what keeps the default release.yaml
-  # byte-identical -- release.yaml.tftpl omits the block entirely when this is
-  # empty rather than emitting `systemd: []`.
+  # default chart set -- release.yaml.tftpl omits the block entirely when this
+  # is empty rather than emitting `systemd: []`.
   enabled_sysexts = distinct([
     for c in local.enabled_components : local.component_spec[c].sysext
     if local.component_spec[c].sysext != null
@@ -595,6 +592,12 @@ locals {
       "kubernetes/helm/values/rancher.yaml" = templatefile("${path.module}/templates/elemental/kubernetes/helm/values/rancher.yaml.tftpl", {
         hostname           = local.rancher_hostname
         bootstrap_password = local.rancher_bootstrap_password
+      })
+    },
+    !contains(local.enabled_components, "gpu-operator") ? {} : {
+      "kubernetes/helm/values/gpu-operator.yaml" = templatefile("${path.module}/templates/elemental/kubernetes/helm/values/gpu-operator.yaml.tftpl", {
+        repository = var.gpu_driver_repository
+        version    = var.gpu_driver_version
       })
     },
     !contains(local.enabled_components, "local-path-provisioner") ? {} : {
@@ -690,7 +693,7 @@ locals {
     # the template's header for the elemental source that makes that work, and
     # for why keeping node identity out of this file matters.
     "kubernetes/cluster.yaml" = templatefile("${path.module}/templates/elemental/kubernetes/cluster.yaml.tftpl", {
-      api_vip      = vultr_load_balancer.api.ipv4
+      api_vip      = local.api_vip
       api_vip_mode = var.api_vip_mode
       api_host     = local.api_host
     })

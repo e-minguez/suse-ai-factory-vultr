@@ -55,9 +55,9 @@ works on them, so they are the only Cloud GPU option this image can use. Set
 them. Most report `deploy_ondemand: false` (preemptible-only, which this module
 does not request), and stock is intermittent.
 
-Passthrough is what makes the supported driver path work: the NVIDIA GPU
-Operator pointed at SUSE's precompiled driver containers, so nothing is
-compiled on the node.
+Passthrough is what makes the driver path work: the NVIDIA GPU Operator
+pointed at precompiled driver containers, so nothing is compiled on the node.
+The release manifest's source does not work on these nodes:
 
 ```yaml
 driver:
@@ -65,6 +65,11 @@ driver:
   usePrecompiled: true
   version: 595
 ```
+
+That registry publishes SLES 16.0 builds only, and a 16.0 module does not load
+on the 16.1 kernel. The module overrides it through
+`gpu_driver_repository`/`gpu_driver_version`, defaulting to an experimental
+OBS 16.1 build of branch `615` — see the top-level README.
 
 ## The real accelerators are bare metal
 

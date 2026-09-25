@@ -76,6 +76,17 @@ resource "vultr_load_balancer" "api" {
     ignore_changes = [health_check[0].path]
   }
 
+  # The provider can record ipv4 = "" if Vultr has not assigned it yet; see
+  # the script and data.http.lb below.
+  provisioner "local-exec" {
+    command = "${path.module}/scripts/wait-for-lb-ipv4.sh"
+    environment = {
+      LB_ID           = self.id
+      TIMEOUT_SECONDS = 600
+      POLL_SECONDS    = 10
+    }
+  }
+
   # 6443 (the API) is the one thing meant to be reachable from anywhere. 9345
   # (the supervisor, used only on node join) is restricted to the NAT gateway's
   # public IPs -- the source a vpc_only node's hairpinned join arrives from --
@@ -170,4 +181,57 @@ resource "vultr_load_balancer" "ingress" {
       source  = firewall_rules.value[1]
     }
   }
+
+  # The provider can record ipv4 = "" if Vultr has not assigned it yet; see
+  # the script and data.http.lb below.
+  provisioner "local-exec" {
+    command = "${path.module}/scripts/wait-for-lb-ipv4.sh"
+    environment = {
+      LB_ID           = self.id
+      TIMEOUT_SECONDS = 600
+      POLL_SECONDS    = 10
+    }
+  }
+}
+
+# Each LB's public IPv4, read back from the API rather than the resource's own
+# ipv4 attribute. The provider can return from create before Vultr assigns the
+# address and records ipv4 = "" -- which a later refresh silently fills in.
+# Everything baked into the image (apiVIP, apiHost, Rancher's hostname) and the
+# build id itself derive from this address, so the stale "" built a cluster
+# with an empty endpoint and the next plan replaced every node. The create-time
+# provisioner above waits for the address; this reads it.
+#
+# No depends_on, deliberately: the id reference alone defers the read to apply
+# on pass 1, when the LB does not exist yet, and lets every later plan read it
+# up front. A depends_on would defer it whenever the LB has ANY pending change
+# -- pass 2's attached_instances update, for one -- making the address unknown,
+# the build id unknown, and every node a planned replacement.
+data "http" "lb" {
+  for_each = merge(
+    { api = vultr_load_balancer.api.id },
+    var.ingress_controller == "traefik" ? { ingress = vultr_load_balancer.ingress[0].id } : {},
+  )
+
+  url = "https://api.vultr.com/v2/load-balancers/${each.value}"
+  request_headers = {
+    Accept        = "application/json"
+    Authorization = "Bearer ${var.vultr_api_key}"
+  }
+
+  retry {
+    attempts = 2
+  }
+
+  lifecycle {
+    postcondition {
+      condition     = self.status_code == 200 && try(jsondecode(self.response_body).load_balancer.ipv4, "") != ""
+      error_message = "Vultr reports no public IPv4 for the ${each.key} load balancer (${each.value}, HTTP ${self.status_code}). It is baked into the image, so the build cannot proceed without it; re-run the apply once Vultr has assigned one."
+    }
+  }
+}
+
+locals {
+  lb_ipv4 = { for k, d in data.http.lb : k => jsondecode(d.response_body).load_balancer.ipv4 }
+  api_vip = local.lb_ipv4["api"]
 }

@@ -15,12 +15,12 @@ output "jumphost_vpc_ip" {
 
 output "kubernetes_api_endpoint" {
   description = "Kubernetes API endpoint, fronted by the load balancer at apiVIP. Reachable once RKE2 is up and (per the two-pass apply) the LB has backends attached."
-  value       = "https://${vultr_load_balancer.api.ipv4}:6443"
+  value       = "https://${local.api_vip}:6443"
 }
 
 output "api_vip" {
   description = "The load balancer's IPv4 -- the address baked into every node's elemental config as network.apiVIP."
-  value       = vultr_load_balancer.api.ipv4
+  value       = local.api_vip
 }
 
 output "api_host" {

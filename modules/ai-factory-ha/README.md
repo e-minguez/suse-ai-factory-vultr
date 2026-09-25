@@ -68,7 +68,7 @@ vultr_load_balancer.api      ──▶ attached_instances = vultr_instance.contr
 vultr_instance.control_plane ──▶ vultr_snapshot_from_url.ai_factory
 vultr_snapshot_from_url      ──▶ terraform_data.image_served
 terraform_data.image_served  ──▶ vultr_instance.jumphost
-vultr_instance.jumphost      ──▶ user_data contains vultr_load_balancer.api.ipv4
+vultr_instance.jumphost      ──▶ user_data contains the LB's IPv4 (data.http.lb)
         └───────────────────────── back to the top
 ```
 
@@ -80,6 +80,17 @@ yet: a Vultr LB with zero backends is a valid, if useless, state. So
 (also default `[]`) rather than from `vultr_bare_metal_server.gpu`.
 Variables are plan-time inputs, not graph edges, so this keeps `count` and
 every dependency plan-known without ever touching the nodes it fronts.
+
+The IPv4 itself is **not** read from `vultr_load_balancer.api.ipv4`. The
+provider can return from create before Vultr assigns the address, recording
+`ipv4 = ""`; the image then bakes an empty `apiVIP` (`rke2-.sslip.io`,
+`https://:6443`), and pass 2's refresh fills in the real address, changes the
+build id and replaces every node. Each LB therefore carries a create-time
+provisioner (`scripts/wait-for-lb-ipv4.sh`) that polls until the address
+exists, and `data.http.lb` reads it back from the API. That data source has no
+`depends_on` on purpose: one would defer its read on pass 2, when the LB has an
+in-place `attached_instances` change, and make every node a planned
+replacement.
 
 `var.gpu_cloud_extra_cidrs` rides the same mechanism for a different reason:
 it carries the NAT gateway's public `/32`s to the cloud GPU nodes' firewall
@@ -598,8 +609,8 @@ future chart is one entry there.
 
 They render in a fixed **canonical** order — `cert-manager, rancher,
 gpu-operator, local-path-provisioner | suse-storage, aif-operator` — never the
-order `var.components` was given in. That is deliberate: the default list has
-to reproduce today's `release.yaml` byte for byte, since `release.yaml` is in
+order `var.components` was given in. That is deliberate: reordering the list
+must not change `release.yaml`, since `release.yaml` is in
 `local.elemental_files`, whose hash is a `time_static.build` trigger that
 names the snapshot — `ForceNew` on every node. `cert-manager` is accepted as
 an explicit entry but never required: it is injected automatically whenever
@@ -854,6 +865,7 @@ reasoning behind each one. Notable ones:
 | `suse_registration_code`, `suse_registry_password` | `null` | optional but highly recommended; when unset, `aif-operator.yaml`'s `suseRegistry:` block is omitted |
 | `nvidia_api_key` | `null` | optional but highly recommended; when unset, `aif-operator.yaml`'s `nvidia:` credentials block is omitted entirely |
 | `nvidia_username` | `"$oauthtoken"` | NGC's convention for API-key auth; override only if your NGC setup expects something else |
+| `gpu_driver_repository` / `gpu_driver_version` | experimental OBS SLES 16.1 build / `"615"` | overrides the release manifest's `driver.repository`/`driver.version` via `gpu-operator.yaml`. The operator pulls `<repo>/driver:<version>-<uname -r>-sles16.1`, so the repo needs a tag for the nodes' exact kernel. Revert to `registry.suse.com/third-party/nvidia` once it publishes 16.1 drivers. Changing either rebuilds the image and replaces every node |
 | `aif_version` | `"2.2.0"` | which AI Factory release manifest to build against. Becomes SUSE/aif's `aif-operator-<version>` tag, so it must be a full `X.Y.Z` (no `"2.2"`), optionally with a pre-release suffix (`"2.3.0-dev.2"`); `2.1.0` is the floor, since `aif-operator-2.0.x` ships no manifest. A tag, not a branch, because it cannot move under a built cluster — but a `check` block still warns when the manifest's own `metadata.version` disagrees, which upstream does. Selects **charts only** — the OS side is `elemental_image` / `core_platform_override` / `sysext_image_overrides`. See [above](#suse-ai-factory-version). Changing it rebuilds the image and replaces every node |
 | `aif_release_manifest_url` | `null` | override: a full raw URL to a release manifest, for a branch ref, a fork or a mirror. When set, `aif_version` is ignored |
 | `components` | `["rancher", "gpu-operator", "local-path-provisioner", "aif-operator"]` | which AI Factory Helm charts `release.yaml` enables — see [above](#suse-ai-factory-components). Changing it rebuilds the image and replaces every node |

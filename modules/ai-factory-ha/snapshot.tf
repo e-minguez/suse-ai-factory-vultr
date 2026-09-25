@@ -21,7 +21,7 @@ resource "time_static" "build" {
     # variable alone would leave a source hash untouched, so no rebuild would
     # happen and nodes would come up from the previous build's snapshot.
     cluster  = var.cluster_name
-    endpoint = vultr_load_balancer.api.ipv4
+    endpoint = local.api_vip
     image    = var.elemental_image # not part of elemental_files; only reaches factory_script
     config   = sha256(jsonencode(local.elemental_files))
 
