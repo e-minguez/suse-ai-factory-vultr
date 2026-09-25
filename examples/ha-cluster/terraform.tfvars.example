@@ -231,6 +231,13 @@ suse_registry_password = "REPLACE_WITH_YOUR_SUSE_REGISTRY_PASSWORD"
 # nvidia_api_key  = "REPLACE_WITH_YOUR_NVIDIA_NGC_API_KEY"
 # nvidia_username = "$oauthtoken"
 
+# GPU operator driver source. DO NOT CHANGE until SUSE publishes SLES 16.1
+# precompiled drivers under registry.suse.com/third-party/nvidia: left unset,
+# the module uses an experimental OBS build of branch 615, the only driver
+# known to load on the nodes' 16.1 kernel. See the top-level README.
+# gpu_driver_repository = "registry.suse.com/third-party/nvidia"
+# gpu_driver_version    = "..."
+
 # --------------------------------------------------------------------------
 # components -- which SUSE AI Factory Helm charts release.yaml enables.
 # Rendered in a fixed canonical order regardless of the order typed here.
