@@ -68,7 +68,7 @@ vultr_load_balancer.api      ──▶ attached_instances = vultr_instance.contr
 vultr_instance.control_plane ──▶ vultr_snapshot_from_url.ai_factory
 vultr_snapshot_from_url      ──▶ terraform_data.image_served
 terraform_data.image_served  ──▶ vultr_instance.jumphost
-vultr_instance.jumphost      ──▶ user_data contains vultr_load_balancer.api.ipv4
+vultr_instance.jumphost      ──▶ user_data contains the LB's IPv4 (data.http.lb)
         └───────────────────────── back to the top
 ```
 
@@ -80,6 +80,17 @@ yet: a Vultr LB with zero backends is a valid, if useless, state. So
 (also default `[]`) rather than from `vultr_bare_metal_server.gpu`.
 Variables are plan-time inputs, not graph edges, so this keeps `count` and
 every dependency plan-known without ever touching the nodes it fronts.
+
+The IPv4 itself is **not** read from `vultr_load_balancer.api.ipv4`. The
+provider can return from create before Vultr assigns the address, recording
+`ipv4 = ""`; the image then bakes an empty `apiVIP` (`rke2-.sslip.io`,
+`https://:6443`), and pass 2's refresh fills in the real address, changes the
+build id and replaces every node. Each LB therefore carries a create-time
+provisioner (`scripts/wait-for-lb-ipv4.sh`) that polls until the address
+exists, and `data.http.lb` reads it back from the API. That data source has no
+`depends_on` on purpose: one would defer its read on pass 2, when the LB has an
+in-place `attached_instances` change, and make every node a planned
+replacement.
 
 `var.gpu_cloud_extra_cidrs` rides the same mechanism for a different reason:
 it carries the NAT gateway's public `/32`s to the cloud GPU nodes' firewall

@@ -59,9 +59,10 @@ locals {
 # fetcher reads the raw off its public side (snapshot.tf builds the URL from
 # main_ip).
 #
-# user_data embeds the LB's ipv4 (cluster.yaml's api_vip), which orders the
-# jumphost after the LB without a depends_on -- safe only because the LB no
-# longer references the control-plane instances (network.tf).
+# user_data embeds the LB's ipv4 (cluster.yaml's api_vip, via data.http.lb),
+# which orders the jumphost after the LB -- and after its address exists --
+# without a depends_on. Safe only because the LB no longer references the
+# control-plane instances (network.tf).
 resource "vultr_instance" "jumphost" {
   region = var.region
   plan   = var.jumphost_plan
