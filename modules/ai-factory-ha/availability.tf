@@ -170,6 +170,60 @@ locals {
   } : {}
 }
 
+# GPU nodes that already exist, so the check below only gates pools that would
+# create something. Without this, every plan re-checks stock for nodes that are
+# already running -- and GPU stock is often exactly one unit, which the
+# cluster's own node is holding, so a healthy cluster failed its next plan.
+#
+# Asked of the Vultr API, not read off vultr_instance.gpu_cloud /
+# vultr_bare_metal_server.gpu: both depends_on the check, so that would be a
+# cycle. Matched on label (= hostname, which carries cluster_name), plan and
+# region: a plan change replaces the node, so it needs stock again. One page of
+# 500 only; a node past it merely looks missing, which runs the check -- the
+# safe direction. Both endpoints 401 without a valid key, so a bad key fails
+# here rather than silently skipping the check.
+data "http" "gpu_existing" {
+  for_each = var.verify_plan_availability ? toset([
+    for p in values(local.gpu_pool_plans) : p.family == "bare metal" ? "bare-metals" : "instances"
+  ]) : toset([])
+
+  url = "https://api.vultr.com/v2/${each.key}?per_page=500"
+  request_headers = {
+    Accept        = "application/json"
+    Authorization = "Bearer ${var.vultr_api_key}"
+  }
+
+  retry {
+    attempts = 2
+  }
+
+  lifecycle {
+    postcondition {
+      condition     = self.status_code == 200
+      error_message = "Vultr returned HTTP ${self.status_code} listing ${each.key}. A 401 means vultr_api_key is missing or invalid."
+    }
+  }
+}
+
+locals {
+  # "label|plan" of every server in the region; the response's list key is the
+  # endpoint name with an underscore (bare-metals -> bare_metals).
+  gpu_existing = toset(flatten([
+    for k, d in data.http.gpu_existing : [
+      for s in jsondecode(d.response_body)[replace(k, "-", "_")] :
+      "${s.label}|${s.plan}" if s.region == var.region
+    ]
+  ]))
+
+  # Per pool, the hostnames the next apply would create.
+  gpu_pool_missing = {
+    for k, p in local.gpu_pool_plans : k => concat(
+      [for n in local.gpu_bare_metal_nodes : n.hostname if p.family == "bare metal" && n.pool == k && !contains(local.gpu_existing, "${n.hostname}|${n.plan}")],
+      [for n in local.gpu_cloud_nodes : n.hostname if p.family == "cloud" && n.pool == k && !contains(local.gpu_existing, "${n.hostname}|${n.plan}")],
+    )
+  }
+}
+
 # One check instance per pool, so the error names the pool that is wrong rather
 # than the first one that fails. Preconditions must attach to a resource's
 # lifecycle, and this check is not an attribute of any real one.
@@ -183,8 +237,8 @@ resource "terraform_data" "gpu_plan_availability_check" {
       # Indexed, not lookup()ed: gpu_plan_types is derived from the same map
       # this resource iterates, so the key is always present and a default
       # would be dead code.
-      condition     = contains(local.gpu_available_plans[each.value.type], each.value.plan)
-      error_message = "GPU pool \"${each.key}\" wants ${each.value.family} plan \"${each.value.plan}\", which is not currently available in region \"${var.region}\". Available type=${each.value.type} plans there: ${join(", ", coalescelist(local.gpu_available_plans[each.value.type], ["<none>"]))}. An empty list can be real -- most regions carry no GPU stock -- but it is also what this endpoint returns instead of a 401 when vultr_api_key is missing or invalid, so check the key before believing it. Note also that the plan's own type field is what matters, not its id prefix: the vcg-a100/b200/h100/mi3 SKUs are type \"vdm\"."
+      condition     = length(local.gpu_pool_missing[each.key]) == 0 || contains(local.gpu_available_plans[each.value.type], each.value.plan)
+      error_message = "GPU pool \"${each.key}\" needs to create ${join(", ", local.gpu_pool_missing[each.key])} on ${each.value.family} plan \"${each.value.plan}\", which is not currently available in region \"${var.region}\". Available type=${each.value.type} plans there: ${join(", ", coalescelist(local.gpu_available_plans[each.value.type], ["<none>"]))}. An empty list can be real -- most regions carry no GPU stock -- but it is also what this endpoint returns instead of a 401 when vultr_api_key is missing or invalid, so check the key before believing it. Note also that the plan's own type field is what matters, not its id prefix: the vcg-a100/b200/h100/mi3 SKUs are type \"vdm\"."
     }
   }
 }
