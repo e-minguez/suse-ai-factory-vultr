@@ -366,7 +366,11 @@ done
 The module runs this check itself during `plan` (`verify_plan_availability`,
 default `true`) and names the offending pool when a plan is missing. Pools
 with `count = 0` are skipped, so a pool can be parked at 0 while its plan is
-out of stock.
+out of stock. So are GPU pools whose nodes all already exist (same label,
+plan and region, looked up through the API): stock is often a single unit,
+held by the cluster's own node, so re-checking it would fail every later plan
+of a healthy cluster. Adding a node or changing a pool's plan re-enables the
+check for that pool.
 
 ### `elemental_image`'s default, and why it isn't the `:3.0` release
 
