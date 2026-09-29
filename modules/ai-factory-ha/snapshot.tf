@@ -43,6 +43,14 @@ resource "time_static" "build" {
     # so it must not renumber the build either.
     sysexts = sha256(jsonencode(local.effective_sysext_overrides))
   }
+
+  lifecycle {
+    # Lives here, not as a postcondition on data.http.lb -- see network.tf.
+    precondition {
+      condition     = alltrue([for k, d in data.http.lb : d.status_code == 200 && local.lb_ipv4[k] != ""])
+      error_message = "Vultr reports no public IPv4 for load balancer(s) ${join(", ", [for k, d in data.http.lb : "${k} (HTTP ${d.status_code})" if d.status_code != 200 || local.lb_ipv4[k] == ""])}. It is baked into the image, so the build cannot proceed without it; re-run the apply once Vultr has assigned one."
+    }
+  }
 }
 
 locals {
