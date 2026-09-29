@@ -91,13 +91,15 @@ output "control_plane_internal_ip" {
 }
 
 locals {
-  # A vpc_only vultr_instance reports main_ip as "0.0.0.0" rather than omitting
-  # it, so filter: an unfiltered list pushes 0.0.0.0/32 into the load
-  # balancer's 9345 rule on pass 2, which is both useless and alarming to read.
+  # vpc_only cloud nodes are dropped by their flag, not by address: main_ip on
+  # one has been seen as "0.0.0.0" AND as its VPC address (10.20.0.9, live
+  # 2026-09-29). The VPC address leaked into the API load balancer's 9345
+  # firewall on pass 2 as a private source, after which the LB accepted no
+  # connections on any port. The "" / "0.0.0.0" filter stays as a backstop.
   gpu_public_ipv4 = [
     for ip in concat(
       [for k in sort(keys(vultr_bare_metal_server.gpu)) : vultr_bare_metal_server.gpu[k].main_ip],
-      [for k in sort(keys(vultr_instance.gpu_cloud)) : vultr_instance.gpu_cloud[k].main_ip],
+      [for k in sort(keys(vultr_instance.gpu_cloud)) : vultr_instance.gpu_cloud[k].main_ip if vultr_instance.gpu_cloud[k].vpc_only != true],
     ) : ip if ip != "" && ip != "0.0.0.0"
   ]
 }
