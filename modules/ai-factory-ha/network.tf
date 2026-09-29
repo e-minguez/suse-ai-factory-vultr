@@ -202,16 +202,26 @@ resource "vultr_load_balancer" "ingress" {
 # with an empty endpoint and the next plan replaced every node. The create-time
 # provisioner above waits for the address; this reads it.
 #
-# No depends_on, deliberately: the id reference alone defers the read to apply
-# on pass 1, when the LB does not exist yet, and lets every later plan read it
-# up front. A depends_on would defer it whenever the LB has ANY pending change
-# -- pass 2's attached_instances update, for one -- making the address unknown,
-# the build id unknown, and every node a planned replacement.
-data "http" "lb" {
-  for_each = merge(
+# The ids go through terraform_data.lb_ids, not straight from the LBs: a data
+# source is deferred to apply whenever a managed resource it references --
+# depends_on OR a plain attribute reference -- has ANY pending change. Pass 2's
+# attached_instances update is one, and deferring made the address unknown, the
+# build id unknown, and every node a planned replacement. Terraform only checks
+# direct references (absent a postcondition, see below), and lb_ids has no
+# change while the ids are stable. Pass 1 (lb_ids being created) and an LB
+# replacement (its input changing) still defer the read until the LB, and its
+# address, exist.
+resource "terraform_data" "lb_ids" {
+  input = merge(
     { api = vultr_load_balancer.api.id },
     var.ingress_controller == "traefik" ? { ingress = vultr_load_balancer.ingress[0].id } : {},
   )
+}
+
+data "http" "lb" {
+  # Keys are plan-time known (static per ingress_controller); only the values,
+  # the ids, can be unknown.
+  for_each = { for k in keys(terraform_data.lb_ids.input) : k => terraform_data.lb_ids.output[k] }
 
   url = "https://api.vultr.com/v2/load-balancers/${each.value}"
   request_headers = {
@@ -223,15 +233,13 @@ data "http" "lb" {
     attempts = 2
   }
 
-  lifecycle {
-    postcondition {
-      condition     = self.status_code == 200 && try(jsondecode(self.response_body).load_balancer.ipv4, "") != ""
-      error_message = "Vultr reports no public IPv4 for the ${each.key} load balancer (${each.value}, HTTP ${self.status_code}). It is baked into the image, so the build cannot proceed without it; re-run the apply once Vultr has assigned one."
-    }
-  }
+  # No postcondition here: one makes the dependency check transitive, so the
+  # LBs' own pending changes defer the read again despite lb_ids. The "got an
+  # address" check is a precondition on time_static.build (snapshot.tf), the
+  # first thing that bakes it in.
 }
 
 locals {
-  lb_ipv4 = { for k, d in data.http.lb : k => jsondecode(d.response_body).load_balancer.ipv4 }
+  lb_ipv4 = { for k, d in data.http.lb : k => try(jsondecode(d.response_body).load_balancer.ipv4, "") }
   api_vip = local.lb_ipv4["api"]
 }
