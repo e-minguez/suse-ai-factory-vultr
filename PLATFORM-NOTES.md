@@ -34,38 +34,48 @@ There is no API lever for this. `uefi` appears on exactly one endpoint,
 `POST /snapshots/create-from-url`, and `POST /bare-metals` has no boot-mode
 parameter.
 
-## Cloud GPU: only the whole-node plans are usable
+## Cloud GPU: passthrough plans only
 
-The `vcg-*` id prefix covers two different products.
+The `vcg-*` id prefix covers two different products, and neither the prefix nor
+the API's `type` field alone says which one a plan is.
 
-**Fractional SKUs** (`vcg-l40s-*` and most `vcg-a16-*` / `vcg-a40-*` sizes)
-report `type: vcg` / `disk_type: CLOUDGPU` and are **vGPU**. Their guest driver
-is installed by running `/opt/nvidia/install.sh` on a booted host, with DKMS
-rebuilding the module on every kernel change and `nvidia-gridd.service` holding
-the licence. An immutable OS can do none of that. The usual escape — NVIDIA's
-precompiled driver containers — is explicitly unavailable: NVIDIA's own
-documentation states they do not support vGPU. So these plans cannot work with
-this image, whatever their stock level says.
+**vGPU plans cannot work with this image.** Their guest driver is installed by
+running `/opt/nvidia/install.sh` on a booted host, with DKMS rebuilding the
+module on every kernel change and `nvidia-gridd.service` holding the licence.
+An immutable OS can do none of that. The usual escape — NVIDIA's precompiled
+driver containers — is explicitly unavailable: NVIDIA's own documentation
+states they do not support vGPU.
 
-**Whole-node SKUs** (`vcg-a100-*`, `vcg-h100-*`, `vcg-b200-*`, `vcg-mi3*`)
-report **`type: vdm` / `disk_type: DEDICATEDMETAL`** despite the `vcg-` prefix,
-and are dedicated hardware with GPU passthrough. The precompiled-driver path
-works on them, so they are the only Cloud GPU option this image can use. The
-prefix is no guide even within one model: `vcg-a16-6c-*`, `vcg-a16-96c-*`,
-`vcg-a40-24c-*` and `vcg-a40-96c-*` are also `vdm`, while the other a16/a40
-sizes are `vcg`. Read the `type` field, never the id. The h100, b200 and mi3xx
-plans report `deploy_ondemand: false` (preemptible-only, which this module does
-not request); the a16/a40/a100 `vdm` plans are on-demand. Stock is
-intermittent.
+**Passthrough plans can.** Two groups:
 
-**The catalogue hides the GPUs on `vdm` plans.** `GET /v2/plans` reports
-`gpu_type: null` and `gpu_vram_gb: null` for every one of them — the 8x B200
-plan shows as 0 VRAM and no GPU — so `vultr-cli plans list | grep -i nvidia`
-finds only the fractional plans. Its `locations` is also unreliable: `[]` from
-`vultr-cli` where the authenticated API said `["sea"]`, and `?type=all` has
-been seen to omit a `vdm` plan that plain `/v2/plans` returned. Identify
-passthrough plans by `type == "vdm"`, and check stock with the region
-availability endpoint below, never the plan's `locations`.
+- **`type: vdm` / `disk_type: DEDICATEDMETAL`**: `vcg-a100-*`, `vcg-h100-*`,
+  `vcg-b200-*`, `vcg-mi3*`, plus `vcg-a16-6c-*`, `vcg-a16-96c-*`,
+  `vcg-a40-24c-*` and `vcg-a40-96c-*`. Dedicated hardware with passthrough;
+  Vultr confirmed this for the big multi-GPU ones.
+- **The L40S plans** (`vcg-l40s-16c/32c/64c-*`, 1/2/4 whole GPUs), although
+  they report `type: vcg` / `disk_type: CLOUDGPU` like the vGPU slices. Vultr's
+  [GPU variants page](https://docs.vultr.com/products/compute/instances/cloud-gpu/explore-gpu-variants)
+  lists the L40S implementation as **Passthrough**, and A16, A40 and A100 as
+  vGPU. That page is per GPU model and incomplete (no H100, B200 or MI3xx), and
+  its A100 "vGPU" contradicts the `vdm` A100 plans. So `vcg` does not mean
+  vGPU. The L40S is also the one GPU this image is known to drive: the evroc
+  `gn-l40s` passthrough VM in the root README ran this exact driver path.
+
+The remaining `vcg` plans — the other a16/a40 sizes — are fractional vGPU.
+
+The h100, b200 and mi3xx plans report `deploy_ondemand: false`
+(preemptible-only, which this module does not request); the a16/a40/a100 `vdm`
+plans and the L40S plans are on-demand. Stock is intermittent.
+
+**The catalogue hides the GPUs on `vdm` plans.** `GET /v2/plans` omits
+`gpu_type`, `gpu_count` and `gpu_vram_gb` on every one of them — the 8x B200
+plan shows as 0 VRAM and no GPU — while the `vcg` plans carry them. So
+`vultr-cli plans list | grep -i nvidia` finds the vGPU and L40S plans and
+misses the rest of the passthrough ones. Its `locations` is also unreliable:
+`[]` from `vultr-cli` where the authenticated API said `["sea"]`, and
+`?type=all` has been seen to omit a `vdm` plan that plain `/v2/plans` returned.
+Check stock with the region availability endpoint below, never the plan's
+`locations`.
 
 Passthrough is what makes the driver path work: the NVIDIA GPU Operator
 pointed at precompiled driver containers, so nothing is compiled on the node.
@@ -125,8 +135,8 @@ indistinguishable from real out-of-stock.
 
 Query it **without `?type=`**: the untyped answer is the union of every family,
 `vdm` included (confirmed against blr's `vcg-a40-24c` and sea's `vcg-b200`).
-To list passthrough-capable stock everywhere — `vdm` cloud plans and GPU bare
-metal — and flag where the catalogue disagrees with it, run
+To list passthrough-capable stock everywhere — `vdm` and L40S cloud plans and
+GPU bare metal — and flag where the catalogue disagrees with it, run
 [`tools/passthrough-stock.sh`](tools/passthrough-stock.sh) (curl and jq only,
 optionally with region ids as arguments). It retries the API's rate limiting
 rather than reading a throttled reply as no stock.

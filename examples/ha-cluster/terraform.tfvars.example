@@ -88,9 +88,10 @@ suse_registry_password = "REPLACE_WITH_YOUR_SUSE_REGISTRY_PASSWORD"
 #       vcg-h100-216c-1914gb-640vram   8x H100      type vdm, on-demand OFF
 #       vcg-b200-248c-2826g-1536vram   8x B200      type vdm, on-demand OFF
 #       vcg-mi325x-*, vcg-mi355x-*                  type vdm, on-demand OFF
-#       vcg-l40s-*, most vcg-a16-*/vcg-a40-*       type vcg -- FRACTIONAL
+#       vcg-l40s-16c/32c/64c-*  1/2/4x L40S  type vcg, but PASSTHROUGH
+#       other vcg-a16-*/vcg-a40-*                   type vcg -- FRACTIONAL
 #       vcg-a16-6c/96c-*, vcg-a40-24c/96c-*         type vdm, despite the model
-#     The fractional (type vcg) SKUs expect the host's vGPU guest driver stack
+#     The fractional SKUs expect the host's vGPU guest driver stack
 #     and are not expected to work on an elemental3 image. Plans with
 #     deploy_ondemand = false can only be launched preemptible, which this
 #     module does not do.

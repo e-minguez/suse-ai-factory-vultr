@@ -6,6 +6,11 @@
 # host without the vGPU guest driver stack needs:
 #   - cloud plans whose own `type` is "vdm" (DEDICATEDMETAL), whatever their
 #     id says -- vcg-a16-6c-* is vdm while vcg-a16-12c-* is fractional "vcg";
+#   - "vcg" (CLOUDGPU) plans on a GPU Vultr documents as passthrough: only the
+#     L40S, per the Implementation column of
+#     https://docs.vultr.com/products/compute/instances/cloud-gpu/explore-gpu-variants
+#     (A16, A40 and A100 are listed as vGPU there). So `vcg` does not mean vGPU;
+#     it is the GPU model that decides.
 #   - bare metal plans with a GPU (gpu_brand set and not "none").
 #
 # Stock comes from GET /v2/regions/{id}/availability WITHOUT ?type=, which
@@ -26,7 +31,7 @@ API=https://api.vultr.com/v2
 get() {
   local url=$1 body code attempt
   for attempt in 1 2 3 4 5; do
-    body=$(curl -sS -w '\n%{http_code}' -H "Authorization: Bearer $VULTR_API_KEY" "$url")
+    body=$(curl -sS --max-time 60 -w '\n%{http_code}' -H "Authorization: Bearer $VULTR_API_KEY" "$url")
     code=${body##*$'\n'}
     body=${body%$'\n'*}
     case $code in
@@ -39,31 +44,56 @@ get() {
   return 1
 }
 
-# id, family, gpu as the catalogue reports it, on-demand, $/mo, catalogue locations
-catalogue=$(
-  {
-    get "$API/plans?type=vdm&per_page=500" | jq -c '.plans[] | {
-      id, family: "cloud (vdm)",
-      gpu: (if .gpu_type then "\(.gpu_type) \(.gpu_vram_gb)GB" else "null" end),
-      ondemand: .deploy_ondemand, cost: .monthly_cost, locations}'
-    get "$API/plans-metal?per_page=500" | jq -c '.plans_metal[]
-      | select(.gpu_brand != null and .gpu_brand != "none") | {
-      id, family: "bare metal",
-      gpu: "\(.gpu_count // "?")x \(.gpu_type)",
-      ondemand: .deploy_ondemand, cost: .monthly_cost, locations}'
-  } | jq -s 'map({(.id): .}) | add'
-)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
 
-# id -> "City, CC", fetched even when regions are given, for the output
-region_list=$(get "$API/regions?per_page=500")
-region_names=$(jq -c '.regions | map({(.id): "\(.city), \(.country)"}) | add' <<<"$region_list")
+# The API's latency swings from 0.3s to 8s per call, run to run, so everything
+# is fetched concurrently: the plan catalogue downloads in the background while
+# the regions are queried 16 at a time -- under Vultr's documented 30 req/s.
+# Even all 33 at once has not drawn a 429; get() retries if it ever does.
+get "$API/plans?per_page=500" >"$tmp/plans.json" &
+p1=$!
+get "$API/plans-metal?per_page=500" >"$tmp/metal.json" &
+p2=$!
+get "$API/regions?per_page=500" >"$tmp/regions.json" &
+p3=$!
+wait $p3
+
+# id -> "City, CC", read even when regions are given, for the output
+region_names=$(jq -c '.regions | map({(.id): "\(.city), \(.country)"}) | add' "$tmp/regions.json")
 
 if [ $# -gt 0 ]; then
   regions=("$@")
 else
   regions=()
-  while read -r r; do regions+=("$r"); done < <(jq -r '.regions[].id' <<<"$region_list")
+  while read -r r; do regions+=("$r"); done < <(jq -r '.regions[].id' "$tmp/regions.json")
 fi
+
+export -f get
+export API VULTR_API_KEY tmp
+printf '%s\n' "${regions[@]}" | xargs -P 16 -I{} bash -c \
+  'get "$API/regions/$1/availability" >"$tmp/$1.avail" || touch "$tmp/$1.failed"' _ {}
+wait $p1 && wait $p2
+if ls "$tmp"/*.failed >/dev/null 2>&1; then
+  echo "error: could not fetch availability for: $(cd "$tmp" && ls -- *.failed | sed 's/\.failed$//' | xargs)" >&2
+  exit 1
+fi
+
+# id, family, gpu as the catalogue reports it, on-demand, $/mo, catalogue locations
+catalogue=$(
+  {
+    jq -c '.plans[]
+      | select(.type == "vdm" or (.type == "vcg" and .gpu_type == "NVIDIA_L40S")) | {
+      id, family: "cloud (\(.type))",
+      gpu: (if .gpu_type then "\(.gpu_count // "?")x \(.gpu_type)" else "null" end),
+      ondemand: .deploy_ondemand, cost: .monthly_cost, locations}' "$tmp/plans.json"
+    jq -c '.plans_metal[]
+      | select(.gpu_brand != null and .gpu_brand != "none") | {
+      id, family: "bare metal",
+      gpu: "\(.gpu_count // "?")x \(.gpu_type)",
+      ondemand: .deploy_ondemand, cost: .monthly_cost, locations}' "$tmp/metal.json"
+  } | jq -s 'map({(.id): .}) | add'
+)
 
 echo "Passthrough stock, $(date -u +%Y-%m-%dT%H:%MZ), ${#regions[@]} regions, $(jq length <<<"$catalogue") candidate plans"
 echo
@@ -72,12 +102,11 @@ echo
 ids=$(jq -r 'keys[]' <<<"$catalogue")
 stock=""
 for r in "${regions[@]}"; do
-  avail=$(get "$API/regions/$r/availability" | jq -r '.available_plans[]')
+  avail=$(jq -r '.available_plans[]' "$tmp/$r.avail")
   if [ -z "$avail" ]; then
     echo "warning: $r returned no available plans at all -- region down, or a key problem" >&2
   fi
   stock+=$(grep -xFf <(printf '%s\n' "$ids") <<<"$avail" | awk -v r="$r" '{print r "\t" $0}' || true)$'\n'
-  sleep 0.5
 done
 stock=$(grep . <<<"$stock" || true)
 
