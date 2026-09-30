@@ -302,7 +302,7 @@ customizing x86_64 images -- it isn't usable here regardless of price.
 `vpc_only = true` it has no public NIC at all, reaching registries through the
 NAT gateway exactly as the control plane does.
 
-`plan_type` is the plan's **own `type` field**, not its id prefix — check it
+What a plan really is shows in its **own `type` field**, not its id prefix — check it
 against an authenticated `GET /v2/plans?type=all`:
 
 | Plan | GPUs | `type` | Notes |
@@ -312,7 +312,8 @@ against an authenticated `GET /v2/plans?type=all`:
 | `vcg-h100-216c-1914gb-640vram` | 8x H100 | `vdm` | `deploy_ondemand: false` |
 | `vcg-b200-248c-2826g-1536vram` | 8x B200 | `vdm` | ~$45,696/mo, `deploy_ondemand: false` |
 | `vcg-mi325x-*`, `vcg-mi355x-*` | 8x MI3xx | `vdm` | `deploy_ondemand: false` |
-| `vcg-a16-*`, `vcg-l40s-*`, `vcg-a40-<24c` | fractional | `vcg` | vGPU — see below |
+| `vcg-l40s-*`, most `vcg-a16-*` / `vcg-a40-*` | fractional | `vcg` | vGPU — see below |
+| `vcg-a16-6c-*`, `vcg-a16-96c-*`, `vcg-a40-24c-*`, `vcg-a40-96c-*` | | `vdm` | not fractional, despite the model |
 
 Two traps:
 
@@ -324,12 +325,8 @@ Two traps:
   request preemptible instances, so those plans will fail at create time even
   when the availability endpoint lists them.
 
-`plan_type` is inferred from the plan id and normally needs no value: every
-ordinary cloud family's prefix already **is** its type (`voc-*` is type `voc`,
-`vx1-*` is `vx1`), and `vcg-*` resolves to `vdm`, right for every whole-node
-SKU. The fractional row above is the only case where the prefix gets it wrong,
-so it is the only case that has to say `plan_type = "vcg"` — and per the trap
-above, those plans are not expected to boot anyway.
+The stock check looks the plan id up in the region's untyped availability
+list, so the type never has to be stated.
 
 #### Standing in a non-GPU plan
 
@@ -356,12 +353,13 @@ endpoint needs the `Authorization` header or it silently answers with an empty
 list rather than a 401:
 
 ```bash
-for t in vbm vdm vcg; do
-  echo "== $t"
-  curl -s -H "Authorization: Bearer $VULTR_API_KEY" \
-    "https://api.vultr.com/v2/regions/<region>/availability?type=$t"
-done
+curl -s -H "Authorization: Bearer $VULTR_API_KEY" \
+  "https://api.vultr.com/v2/regions/<region>/availability" \
+  | jq -r '.available_plans[]' | grep -E '^(vbm|vcg)-'
 ```
+
+Leave `?type=` off: untyped, it returns every family. To sweep every region
+for passthrough-capable stock, see `PLATFORM-NOTES.md`'s "Checking stock".
 
 The module runs this check itself during `plan` (`verify_plan_availability`,
 default `true`) and names the offending pool when a plan is missing. Pools

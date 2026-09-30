@@ -216,13 +216,12 @@ variable "gpu_bare_metal_pools" {
 
 variable "gpu_cloud_pools" {
   type = map(object({
-    plan      = string
-    count     = optional(number, 1)
-    plan_type = optional(string, null)
-    vpc_only  = optional(bool, true)
+    plan     = string
+    count    = optional(number, 1)
+    vpc_only = optional(bool, true)
   }))
   default     = {}
-  description = "Cloud GPU worker pools, keyed by pool name, provisioned as vultr_instance. Unlike bare metal these can drop the public NIC entirely, and do by default (vpc_only = true) -- egress goes through the NAT gateway like the control plane's, and admin access through the jumphost. Set vpc_only = false for a public NIC, still behind the Vultr firewall group, when you want direct SSH or do not want multi-GB driver pulls funnelled through one NAT gateway. plan_type is the plan's own type field, used only to scope the stock check; leave it null and the module infers it from the plan id -- the prefix for every ordinary family, \"vdm\" for vcg-*. Set it to \"vcg\" explicitly for the fractional vGPU SKUs, the one case the prefix gets wrong."
+  description = "Cloud GPU worker pools, keyed by pool name, provisioned as vultr_instance. Unlike bare metal these can drop the public NIC entirely, and do by default (vpc_only = true) -- egress goes through the NAT gateway like the control plane's, and admin access through the jumphost. Set vpc_only = false for a public NIC, still behind the Vultr firewall group, when you want direct SSH or do not want multi-GB driver pulls funnelled through one NAT gateway."
 }
 
 variable "jumphost_plan" {

@@ -362,13 +362,12 @@ variable "gpu_bare_metal_pools" {
 
 variable "gpu_cloud_pools" {
   type = map(object({
-    plan      = string
-    count     = optional(number, 1)
-    plan_type = optional(string, null)
-    vpc_only  = optional(bool, true)
+    plan     = string
+    count    = optional(number, 1)
+    vpc_only = optional(bool, true)
   }))
   default     = {}
-  description = "Cloud GPU worker pools, keyed by pool name, provisioned as vultr_instance. plan_type is the plan's OWN type field -- the query parameter availability.tf scopes its stock check to -- and is usually inferred, so leave it null. The inference (local.gpu_cloud_plan_types in availability.tf) is: anything but vcg-* takes the id prefix, which for every ordinary family IS the type (voc-* is type voc, vx1-* is vx1, and so on); vcg-* takes \"vdm\". Set it explicitly only for the fractional vGPU SKUs, where the prefix genuinely lies in the other direction. The whole-node accelerator SKUs (vcg-a100-*, vcg-b200-*, vcg-h100-*, vcg-mi3*, vcg-a40-96c-*) are all type \"vdm\"/DEDICATEDMETAL, while only vcg-a16-*, vcg-a40-<24c and vcg-l40s-* are type \"vcg\"/CLOUDGPU -- one prefix covering two types is the whole reason this field exists. Read it from `GET /v2/plans?type=all` with an Authorization header; without the header both type and locations lie. vpc_only defaults to TRUE: a cloud GPU worker needs nothing from the internet that the NAT gateway cannot give it, and a public NIC it never uses is attack surface plus a second address the cluster has to be told to ignore (see write-node-ip.sh). Set it false to get a public NIC -- firewalled by vultr_firewall_group.gpu_cloud either way -- when you want direct SSH, or when routing every driver and container image pull through the single shared NAT gateway is the wrong tradeoff, which it may well be for multi-GB GPU-operator driver images. Bare metal has no such choice: vultr_bare_metal_server always has a public NIC, so the dual-NIC path exists regardless of this default. An ordinary non-GPU cloud plan is accepted too: most regions carry no vdm/vcg stock at all, and a cheap dedicated-vCPU instance is the only way to exercise this path -- cloud worker join, the firewall group, dual-NIC metadata, scale-out -- without one. Such a node is a worker like any other; it simply never gets a GPU, and the gpu-operator's node feature discovery leaves it alone."
+  description = "Cloud GPU worker pools, keyed by pool name, provisioned as vultr_instance. The plan's stock is checked by id alone, so which Vultr type it reports (vcg-* covers both vdm and vcg) does not matter here. vpc_only defaults to TRUE: a cloud GPU worker needs nothing from the internet that the NAT gateway cannot give it, and a public NIC it never uses is attack surface plus a second address the cluster has to be told to ignore (see write-node-ip.sh). Set it false to get a public NIC -- firewalled by vultr_firewall_group.gpu_cloud either way -- when you want direct SSH, or when routing every driver and container image pull through the single shared NAT gateway is the wrong tradeoff, which it may well be for multi-GB GPU-operator driver images. Bare metal has no such choice: vultr_bare_metal_server always has a public NIC, so the dual-NIC path exists regardless of this default. An ordinary non-GPU cloud plan is accepted too: most regions carry no vdm/vcg stock at all, and a cheap dedicated-vCPU instance is the only way to exercise this path -- cloud worker join, the firewall group, dual-NIC metadata, scale-out -- without one. Such a node is a worker like any other; it simply never gets a GPU, and the gpu-operator's node feature discovery leaves it alone."
 
   validation {
     condition     = alltrue([for k in keys(var.gpu_cloud_pools) : can(regex("^[a-z0-9]([a-z0-9-]{0,14}[a-z0-9])?$", k))])
@@ -391,30 +390,6 @@ variable "gpu_cloud_pools" {
   validation {
     condition     = alltrue([for k, p in var.gpu_cloud_pools : !startswith(p.plan, "vbm-")])
     error_message = "gpu_cloud_pools takes cloud instance plans, not vbm-* bare metal ones -- those go in gpu_bare_metal_pools."
-  }
-
-  validation {
-    # Checks the RESOLVED type, so a plan id with an unknown prefix and no
-    # explicit plan_type fails here with a readable message rather than as an
-    # HTTP 400 from the availability endpoint. The inference expression is
-    # duplicated from local.gpu_cloud_plan_types in availability.tf, and has to
-    # be: Terraform 1.9+ does let a validation reference a local, but that local
-    # is itself derived from var.gpu_cloud_pools, so referencing it here is a
-    # graph cycle ("Cycle: local.gpu_cloud_plan_types (expand), var.gpu_cloud_pools
-    # (validation)" -- confirmed against Terraform 1.16.3). Keep the two in step.
-    #
-    # The allowed set is the two GPU families plus the ordinary cloud ones that
-    # availability.tf already queries for the control plane. A non-GPU plan
-    # here is legitimate: it is the only way to exercise the cloud-worker path
-    # (scale out, firewall group, dual-NIC metadata) in a region with no GPU
-    # stock, which is most of them.
-    condition = alltrue([
-      for k, p in var.gpu_cloud_pools : contains(
-        ["vdm", "vcg", "vc2", "vhf", "vhp", "voc", "vx1"],
-        coalesce(p.plan_type, startswith(p.plan, "vcg-") ? "vdm" : split("-", p.plan)[0])
-      )
-    ])
-    error_message = "gpu_cloud_pools plan_type must resolve to one of vdm, vcg (the GPU families) or vc2, vhf, vhp, voc, vx1 (ordinary cloud plans, for testing the cloud-worker path without GPU stock). Left null it is inferred from the plan id -- the prefix, except vcg-* which resolves to vdm -- so an unrecognised prefix needs plan_type set explicitly. It is the Vultr plan's own type field, not its id prefix."
   }
 
   validation {
