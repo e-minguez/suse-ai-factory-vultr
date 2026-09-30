@@ -51,7 +51,10 @@ states they do not support vGPU.
 - **`type: vdm` / `disk_type: DEDICATEDMETAL`**: `vcg-a100-*`, `vcg-h100-*`,
   `vcg-b200-*`, `vcg-mi3*`, plus `vcg-a16-6c-*`, `vcg-a16-96c-*`,
   `vcg-a40-24c-*` and `vcg-a40-96c-*`. Dedicated hardware with passthrough;
-  Vultr confirmed this for the big multi-GPU ones.
+  Vultr confirmed this for the big multi-GPU ones. Of these, only
+  `vcg-a40-24c-120g-48vram` (blr) has been tested: on 2026-09-30 the 615 driver
+  loaded and `nvidia-smi -q` reported a full `NVIDIA A40` (46068MiB) with
+  `Virtualization Mode: Pass-Through`.
 - **The L40S plans** (`vcg-l40s-16c/32c/64c-*`, 1/2/4 whole GPUs), although
   they report `type: vcg` / `disk_type: CLOUDGPU` like the vGPU slices. Vultr's
   [GPU variants page](https://docs.vultr.com/products/compute/instances/cloud-gpu/explore-gpu-variants)
