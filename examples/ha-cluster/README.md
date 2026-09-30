@@ -312,12 +312,13 @@ against an authenticated `GET /v2/plans?type=all`:
 | `vcg-h100-216c-1914gb-640vram` | 8x H100 | `vdm` | `deploy_ondemand: false` |
 | `vcg-b200-248c-2826g-1536vram` | 8x B200 | `vdm` | ~$45,696/mo, `deploy_ondemand: false` |
 | `vcg-mi325x-*`, `vcg-mi355x-*` | 8x MI3xx | `vdm` | `deploy_ondemand: false` |
-| `vcg-l40s-*`, most `vcg-a16-*` / `vcg-a40-*` | fractional | `vcg` | vGPU — see below |
+| `vcg-l40s-16c/32c/64c-*` | 1/2/4x L40S | `vcg` | **passthrough** per Vultr's docs, despite `vcg`; on-demand |
+| other `vcg-a16-*` / `vcg-a40-*` | fractional | `vcg` | vGPU — see below |
 | `vcg-a16-6c-*`, `vcg-a16-96c-*`, `vcg-a40-24c-*`, `vcg-a40-96c-*` | | `vdm` | not fractional, despite the model |
 
 Two traps:
 
-- **Fractional (`type: vcg`) SKUs are not expected to work.** They are vGPU
+- **Fractional vGPU SKUs are not expected to work.** They are vGPU
   slices and need the matching NVIDIA guest driver built against the host's
   vGPU manager, which an elemental3 image does not carry and cannot DKMS-build
   into an immutable rootfs.

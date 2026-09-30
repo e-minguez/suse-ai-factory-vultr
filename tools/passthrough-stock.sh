@@ -6,6 +6,11 @@
 # host without the vGPU guest driver stack needs:
 #   - cloud plans whose own `type` is "vdm" (DEDICATEDMETAL), whatever their
 #     id says -- vcg-a16-6c-* is vdm while vcg-a16-12c-* is fractional "vcg";
+#   - "vcg" (CLOUDGPU) plans on a GPU Vultr documents as passthrough: only the
+#     L40S, per the Implementation column of
+#     https://docs.vultr.com/products/compute/instances/cloud-gpu/explore-gpu-variants
+#     (A16, A40 and A100 are listed as vGPU there). So `vcg` does not mean vGPU;
+#     it is the GPU model that decides.
 #   - bare metal plans with a GPU (gpu_brand set and not "none").
 #
 # Stock comes from GET /v2/regions/{id}/availability WITHOUT ?type=, which
@@ -46,7 +51,7 @@ trap 'rm -rf "$tmp"' EXIT
 # is fetched concurrently: the plan catalogue downloads in the background while
 # the regions are queried 16 at a time -- under Vultr's documented 30 req/s.
 # Even all 33 at once has not drawn a 429; get() retries if it ever does.
-get "$API/plans?type=vdm&per_page=500" >"$tmp/vdm.json" &
+get "$API/plans?per_page=500" >"$tmp/plans.json" &
 p1=$!
 get "$API/plans-metal?per_page=500" >"$tmp/metal.json" &
 p2=$!
@@ -77,10 +82,11 @@ fi
 # id, family, gpu as the catalogue reports it, on-demand, $/mo, catalogue locations
 catalogue=$(
   {
-    jq -c '.plans[] | {
-      id, family: "cloud (vdm)",
-      gpu: (if .gpu_type then "\(.gpu_type) \(.gpu_vram_gb)GB" else "null" end),
-      ondemand: .deploy_ondemand, cost: .monthly_cost, locations}' "$tmp/vdm.json"
+    jq -c '.plans[]
+      | select(.type == "vdm" or (.type == "vcg" and .gpu_type == "NVIDIA_L40S")) | {
+      id, family: "cloud (\(.type))",
+      gpu: (if .gpu_type then "\(.gpu_count // "?")x \(.gpu_type)" else "null" end),
+      ondemand: .deploy_ondemand, cost: .monthly_cost, locations}' "$tmp/plans.json"
     jq -c '.plans_metal[]
       | select(.gpu_brand != null and .gpu_brand != "none") | {
       id, family: "bare metal",
