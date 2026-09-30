@@ -126,20 +126,10 @@ indistinguishable from real out-of-stock.
 Query it **without `?type=`**: the untyped answer is the union of every family,
 `vdm` included (confirmed against blr's `vcg-a40-24c` and sea's `vcg-b200`).
 To list passthrough-capable stock everywhere — `vdm` cloud plans and GPU bare
-metal:
-
-```bash
-H="Authorization: Bearer $VULTR_API_KEY"
-{ curl -s -H "$H" "https://api.vultr.com/v2/plans?type=vdm&per_page=500" | jq -r '.plans[].id'
-  curl -s -H "$H" "https://api.vultr.com/v2/plans-metal?per_page=500" \
-    | jq -r '.plans_metal[] | select(.gpu_brand != null and .gpu_brand != "none") | .id'
-} > /tmp/passthrough-plans
-for r in $(curl -s "https://api.vultr.com/v2/regions?per_page=100" | jq -r '.regions[].id'); do
-  sleep 1  # the API rate-limits; a throttled reply parses as no stock
-  curl -s -H "$H" "https://api.vultr.com/v2/regions/$r/availability" \
-    | jq -r '.available_plans[]?' | grep -xFf /tmp/passthrough-plans | sed "s/^/$r /"
-done
-```
+metal — and flag where the catalogue disagrees with it, run
+[`tools/passthrough-stock.sh`](tools/passthrough-stock.sh) (curl and jq only,
+optionally with region ids as arguments). It retries the API's rate limiting
+rather than reading a throttled reply as no stock.
 
 On 2026-09-30 that found exactly two, across all 33 regions: `vcg-a40-24c-120g-48vram`
 in blr (on-demand) and `vcg-b200-248c-2826g-1536vram` in sea (preemptible-only).

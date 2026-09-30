@@ -359,7 +359,7 @@ curl -s -H "Authorization: Bearer $VULTR_API_KEY" \
 ```
 
 Leave `?type=` off: untyped, it returns every family. To sweep every region
-for passthrough-capable stock, see `PLATFORM-NOTES.md`'s "Checking stock".
+for passthrough-capable stock, run `tools/passthrough-stock.sh`.
 
 The module runs this check itself during `plan` (`verify_plan_availability`,
 default `true`) and names the offending pool when a plan is missing. Pools
