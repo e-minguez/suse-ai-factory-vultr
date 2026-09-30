@@ -54,11 +54,15 @@ catalogue=$(
   } | jq -s 'map({(.id): .}) | add'
 )
 
+# id -> "City, CC", fetched even when regions are given, for the output
+region_list=$(get "$API/regions?per_page=500")
+region_names=$(jq -c '.regions | map({(.id): "\(.city), \(.country)"}) | add' <<<"$region_list")
+
 if [ $# -gt 0 ]; then
   regions=("$@")
 else
   regions=()
-  while read -r r; do regions+=("$r"); done < <(get "$API/regions?per_page=500" | jq -r '.regions[].id')
+  while read -r r; do regions+=("$r"); done < <(jq -r '.regions[].id' <<<"$region_list")
 fi
 
 echo "Passthrough stock, $(date -u +%Y-%m-%dT%H:%MZ), ${#regions[@]} regions, $(jq length <<<"$catalogue") candidate plans"
@@ -81,10 +85,10 @@ if [ -z "$stock" ]; then
   echo "No passthrough plan is in stock in any region checked."
 else
   {
-    printf 'REGION\tPLAN\tFAMILY\tGPU (catalogue)\tON-DEMAND\t$/MO\n'
+    printf 'REGION\tLOCATION\tPLAN\tFAMILY\tGPU (catalogue)\tON-DEMAND\t$/MO\n'
     while IFS=$'\t' read -r r p; do
-      jq -r --arg r "$r" --arg p "$p" --argjson c "$catalogue" \
-        '$c[$p] | [$r, $p, .family, .gpu, .ondemand, .cost] | @tsv' <<<null
+      jq -r --arg r "$r" --arg p "$p" --argjson c "$catalogue" --argjson n "$region_names" \
+        '$c[$p] | [$r, ($n[$r] // "?"), $p, .family, .gpu, .ondemand, .cost] | @tsv' <<<null
     done <<<"$stock"
   } | column -t -s $'\t'
 fi
@@ -97,7 +101,7 @@ found=0
 while IFS=$'\t' read -r r p; do
   [ -n "$p" ] || continue
   if ! jq -e --arg r "$r" --arg p "$p" --argjson c "$catalogue" '$c[$p].locations | index($r)' <<<null >/dev/null; then
-    echo "  $p is in stock in $r, but its catalogue locations are $(jq -c --arg p "$p" --argjson c "$catalogue" '$c[$p].locations' <<<null)"
+    echo "  $p is in stock in $r ($(jq -r --arg r "$r" '.[$r] // "?"' <<<"$region_names")), but its catalogue locations are $(jq -c --arg p "$p" --argjson c "$catalogue" '$c[$p].locations' <<<null)"
     found=1
   fi
 done <<<"$stock"
