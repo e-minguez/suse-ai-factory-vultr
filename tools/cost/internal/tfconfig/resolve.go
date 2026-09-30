@@ -51,9 +51,7 @@ type BareMetalPool struct {
 }
 
 // CloudPool mirrors one entry of gpu_cloud_pools after optional() defaults
-// have been applied (variables.tf:311-377). plan_type is deliberately not
-// carried into Config: it steers Terraform's own availability pre-check
-// (availability.tf) and has no effect on price.
+// have been applied (variables.tf:311-377).
 type CloudPool struct {
 	Name    string
 	Plan    string

@@ -38,7 +38,7 @@ parameter.
 
 The `vcg-*` id prefix covers two different products.
 
-**Fractional SKUs** (`vcg-a16-*`, `vcg-a40-*` under 24 cores, `vcg-l40s-*`)
+**Fractional SKUs** (`vcg-l40s-*` and most `vcg-a16-*` / `vcg-a40-*` sizes)
 report `type: vcg` / `disk_type: CLOUDGPU` and are **vGPU**. Their guest driver
 is installed by running `/opt/nvidia/install.sh` on a booted host, with DKMS
 rebuilding the module on every kernel change and `nvidia-gridd.service` holding
@@ -50,10 +50,22 @@ this image, whatever their stock level says.
 **Whole-node SKUs** (`vcg-a100-*`, `vcg-h100-*`, `vcg-b200-*`, `vcg-mi3*`)
 report **`type: vdm` / `disk_type: DEDICATEDMETAL`** despite the `vcg-` prefix,
 and are dedicated hardware with GPU passthrough. The precompiled-driver path
-works on them, so they are the only Cloud GPU option this image can use. Set
-`plan_type = "vdm"` on the pool — a `type=vcg` availability query never returns
-them. Most report `deploy_ondemand: false` (preemptible-only, which this module
-does not request), and stock is intermittent.
+works on them, so they are the only Cloud GPU option this image can use. The
+prefix is no guide even within one model: `vcg-a16-6c-*`, `vcg-a16-96c-*`,
+`vcg-a40-24c-*` and `vcg-a40-96c-*` are also `vdm`, while the other a16/a40
+sizes are `vcg`. Read the `type` field, never the id. The h100, b200 and mi3xx
+plans report `deploy_ondemand: false` (preemptible-only, which this module does
+not request); the a16/a40/a100 `vdm` plans are on-demand. Stock is
+intermittent.
+
+**The catalogue hides the GPUs on `vdm` plans.** `GET /v2/plans` reports
+`gpu_type: null` and `gpu_vram_gb: null` for every one of them — the 8x B200
+plan shows as 0 VRAM and no GPU — so `vultr-cli plans list | grep -i nvidia`
+finds only the fractional plans. Its `locations` is also unreliable: `[]` from
+`vultr-cli` where the authenticated API said `["sea"]`, and `?type=all` has
+been seen to omit a `vdm` plan that plain `/v2/plans` returned. Identify
+passthrough plans by `type == "vdm"`, and check stock with the region
+availability endpoint below, never the plan's `locations`.
 
 Passthrough is what makes the driver path work: the NVIDIA GPU Operator
 pointed at precompiled driver containers, so nothing is compiled on the node.
@@ -111,16 +123,18 @@ region. **Send the `Authorization` header** — unauthenticated, the endpoint ha
 been seen to answer HTTP 200 with an empty list rather than a 401, which is
 indistinguishable from real out-of-stock.
 
-```bash
-for r in $(curl -s "https://api.vultr.com/v2/regions?per_page=100" | jq -r '.regions[].id'); do
-  for t in vcg vdm vbm; do
-    echo "$r $t: $(curl -s -H "Authorization: Bearer $VULTR_API_KEY" \
-      "https://api.vultr.com/v2/regions/$r/availability?type=$t" | jq -c '.available_plans')"
-  done
-done
-```
+Query it **without `?type=`**: the untyped answer is the union of every family,
+`vdm` included (confirmed against blr's `vcg-a40-24c` and sea's `vcg-b200`).
+To list passthrough-capable stock everywhere — `vdm` cloud plans and GPU bare
+metal — and flag where the catalogue disagrees with it, run
+[`tools/passthrough-stock.sh`](tools/passthrough-stock.sh) (curl and jq only,
+optionally with region ids as arguments). It retries the API's rate limiting
+rather than reading a throttled reply as no stock.
 
-The module runs the same query at plan time, one precondition per pool; see the
+On 2026-09-30 that found exactly two, across all 33 regions: `vcg-a40-24c-120g-48vram`
+in blr (on-demand) and `vcg-b200-248c-2826g-1536vram` in sea (preemptible-only).
+
+The module runs the same untyped query at plan time, one precondition per pool; see the
 root README's "Fast-fail on availability".
 
 ## Sources

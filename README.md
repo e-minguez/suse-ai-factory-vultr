@@ -74,18 +74,21 @@ Vultr GPU stock is limited, and a create against an out-of-stock plan fails
 partway through an apply. The module checks first, one precondition per pool:
 
 ```
-GET https://api.vultr.com/v2/regions/{region}/availability?type={vbm|vdm|vcg}
+GET https://api.vultr.com/v2/regions/{region}/availability
 ```
 
 It returns `available_plans`, which is live stock rather than the set of plans
-merely offered in the region. The read happens during `terraform plan`, so a
+merely offered in the region. It's queried without `?type=`, which returns every
+family at once; a typed query would need the plan's type, and the `vcg-` id
+prefix does not determine it. The read happens during `terraform plan`, so a
 bad `region`/`plan` combination fails before anything is created:
 
 ```
 Error: Resource precondition failed
 
-  Bare metal plan "vbm-24c-256gb-amd" is not currently available in region
-  "ams". Available bare metal plans there: vbm-8c-132gb, vbm-6c-32gb, ...
+  GPU pool "gpu" needs to create vultr-gpu-01 on bare metal plan
+  "vbm-24c-256gb-amd", which is not currently available in region "ams".
+  Bare metal and vcg- plans available there: vbm-8c-132gb, vbm-6c-32gb, ...
 ```
 
 Send the `Authorization` header: unauthenticated, the endpoint answers HTTP 200
